@@ -3,18 +3,14 @@
 Pod - CLI Podcast Manager with Progress Bars, Rename, Refresh, Search, Title Download, and Queue System
 """
 import argparse
+
 from rich.console import Console
 
-# Import core components and command handlers
-from podcore import (
-    PodConfig,
-    PlaylistDB,
-    ManifestDB,
-    QueueDB,
-    PodcastFetcher,
-    Downloader,
-)
 import cmdcore as commands
+# Import core components and command handlers
+from podcore import (Downloader, ManifestDB, PlaylistDB, PodcastFetcher,
+                     PodConfig, QueueDB)
+
 
 def main():
     parser = argparse.ArgumentParser(

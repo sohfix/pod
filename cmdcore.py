@@ -8,6 +8,7 @@ import time
 
 from rich.table import Table
 
+
 # Helper function to get components from the context
 def _get_components(context):
     return (
@@ -20,13 +21,17 @@ def _get_components(context):
         context["pldb"],
     )
 
+
 def handle_init(args, context):
     console, _, _, _, _, _, _ = _get_components(context)
     data_dir = os.path.expanduser("~/apps/podx-app/data")
     os.makedirs(data_dir, exist_ok=True)
     with open(os.path.join(data_dir, "PodFile"), "w") as f:
-        f.write("[podcasts]\n\n[directories]\n\n[other_settings]\ndefault_dir = ~/Podcasts/Default\n")
+        f.write(
+            "[podcasts]\n\n[directories]\n\n[other_settings]\ndefault_dir = ~/Podcasts/Default\n"
+        )
     console.print("[green]Initialized configuration.[/]")
+
 
 def handle_add(args, context):
     console, cfg, _, _, _, _, _ = _get_components(context)
@@ -35,6 +40,7 @@ def handle_add(args, context):
         cfg.directories[args.name] = args.directory
     cfg.save()
     console.print(f"[cyan]Added podcast[/] '{args.name}'.")
+
 
 def handle_remove(args, context):
     console, cfg, _, _, _, _, _ = _get_components(context)
@@ -46,6 +52,7 @@ def handle_remove(args, context):
     cfg.save()
     console.print(f"[red]Removed podcast:[/] {args.name}")
 
+
 def handle_list(args, context):
     console, cfg, _, _, _, _, _ = _get_components(context)
     table = Table(title="Your Podcasts")
@@ -56,6 +63,7 @@ def handle_list(args, context):
         directory = cfg.get_directory(name)
         table.add_row(name, rss, directory)
     console.print(table)
+
 
 def handle_download(args, context):
     console, cfg, fetcher, _, downloader, _, _ = _get_components(context)
@@ -72,6 +80,7 @@ def handle_download(args, context):
         mark = "[green]✓[/]" if ok else "[red]✗[/]"
         console.print(f"{mark} {ep.title[:50]} — {msg}")
 
+
 def handle_download_title(args, context):
     console, cfg, fetcher, _, downloader, _, _ = _get_components(context)
     if args.pod not in cfg.podcasts:
@@ -86,6 +95,7 @@ def handle_download_title(args, context):
     else:
         console.print("[yellow]Episode not found.[/]")
 
+
 def handle_rename(args, context):
     console, cfg, _, _, _, _, _ = _get_components(context)
     old, new = args.oldname, args.newname
@@ -98,6 +108,7 @@ def handle_rename(args, context):
     cfg.save()
     console.print(f"[yellow]Renamed[/] '{old}' → '{new}'")
 
+
 def handle_refresh(args, context):
     console, cfg, fetcher, _, _, _, _ = _get_components(context)
     names = [args.name] if args.name else list(cfg.podcasts)
@@ -108,6 +119,7 @@ def handle_refresh(args, context):
             console.print(f"[green]✔[/] {len(podcast.episodes)} episodes")
         except Exception as e:
             console.print(f"[red]✘[/] {name}: {e}")
+
 
 def handle_search(args, context):
     console, cfg, fetcher, _, _, _, _ = _get_components(context)
@@ -122,13 +134,16 @@ def handle_search(args, context):
         except Exception as e:
             console.print(f"[red]{name}[/] error: {e}")
 
+
 def handle_search_all(args, context):
     """Searches title and description of all episodes in all podcasts."""
     console, cfg, fetcher, _, _, _, _ = _get_components(context)
     query = args.query.lower()
     found_episodes = []
 
-    console.print(f"🔍 Searching all podcasts for '[bold yellow]{args.query}[/bold yellow]'...")
+    console.print(
+        f"🔍 Searching all podcasts for '[bold yellow]{args.query}[/bold yellow]'..."
+    )
 
     for name, rss_url in cfg.podcasts.items():
         console.print(f"  -> Checking [cyan]{name}[/cyan]...")
@@ -163,6 +178,7 @@ def handle_search_all(args, context):
 
     console.print(table)
 
+
 def handle_info(args, context):
     console, cfg, fetcher, db, _, _, _ = _get_components(context)
     name = args.name
@@ -171,8 +187,12 @@ def handle_info(args, context):
         return
     try:
         podcast, fetched_summary = fetcher.fetch_with_description(cfg.podcasts[name])
-        summary = cfg.get_summary(name) or fetched_summary or "[dim]No summary available.[/]"
-        latest = max((ep.pub_date for ep in podcast.episodes if ep.pub_date), default="Unknown")
+        summary = (
+            cfg.get_summary(name) or fetched_summary or "[dim]No summary available.[/]"
+        )
+        latest = max(
+            (ep.pub_date for ep in podcast.episodes if ep.pub_date), default="Unknown"
+        )
         count = len(podcast.episodes)
         cursor = db.conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM manifest WHERE podcast=?", (name,))
@@ -186,6 +206,7 @@ def handle_info(args, context):
     except Exception as e:
         console.print(f"[red]Failed to fetch info:[/] {e}")
 
+
 def handle_clean(args, context):
     console, cfg, _, db, _, _, _ = _get_components(context)
     if args.name not in cfg.podcasts:
@@ -195,6 +216,7 @@ def handle_clean(args, context):
     cursor.execute("DELETE FROM manifest WHERE podcast=?", (args.name,))
     db.conn.commit()
     console.print(f"[yellow]Cleared manifest entries for:[/] {args.name}")
+
 
 def handle_set_summary(args, context):
     console, cfg, _, _, _, _, _ = _get_components(context)
@@ -206,11 +228,13 @@ def handle_set_summary(args, context):
     cfg.set_summary(name, summary_text)
     console.print(f"[green]Set custom summary for:[/] {name}")
 
+
 # --- Queue Commands ---
 def handle_queue_add(args, context):
     console, _, _, _, _, qdb, _ = _get_components(context)
     qdb.add(args.pod, args.title)
     console.print(f"[cyan]Queued:[/] {args.title}")
+
 
 def handle_queue_list(args, context):
     console, _, _, _, _, qdb, _ = _get_components(context)
@@ -220,6 +244,7 @@ def handle_queue_list(args, context):
     else:
         for pod, title in queue:
             console.print(f"[blue]{pod}[/] — {title}")
+
 
 def handle_queue_download(args, context):
     console, cfg, fetcher, _, downloader, qdb, _ = _get_components(context)
@@ -238,10 +263,12 @@ def handle_queue_download(args, context):
             console.print(f"[yellow]Not found:[/] {title}")
     qdb.reset()
 
+
 def handle_queue_remove(args, context):
     console, _, _, _, _, qdb, _ = _get_components(context)
     qdb.remove(args.title)
     console.print(f"[yellow]Removed from queue:[/] {args.title}")
+
 
 def handle_queue_reset(args, context):
     console, _, _, _, _, qdb, _ = _get_components(context)
@@ -264,6 +291,7 @@ def handle_playlist(args, context):
     if handler:
         handler(args, context)
 
+
 def _playlist_list(args, context):
     console, _, _, _, _, _, pldb = _get_components(context)
     names = pldb.list_playlists()
@@ -274,20 +302,24 @@ def _playlist_list(args, context):
         for name in names:
             console.print(f"• {name}")
 
+
 def _playlist_create(args, context):
     console, _, _, _, _, _, pldb = _get_components(context)
     pldb.create(args.name)
     console.print(f"[green]Created playlist:[/] {args.name}")
+
 
 def _playlist_delete(args, context):
     console, _, _, _, _, _, pldb = _get_components(context)
     pldb.delete(args.name)
     console.print(f"[red]Deleted playlist:[/] {args.name}")
 
+
 def _playlist_rename(args, context):
     console, _, _, _, _, _, pldb = _get_components(context)
     pldb.rename(args.old, args.new)
     console.print(f"[yellow]Renamed playlist:[/] {args.old} → {args.new}")
+
 
 def _playlist_add(args, context):
     console, _, _, _, _, _, pldb = _get_components(context)
@@ -296,6 +328,7 @@ def _playlist_add(args, context):
         return
     pldb.add_episode(args.playlist, args.pod, args.title)
     console.print(f"[green]Added to '{args.playlist}':[/] {args.title}")
+
 
 def _playlist_show(args, context):
     console, _, _, _, _, _, pldb = _get_components(context)
@@ -311,6 +344,7 @@ def _playlist_show(args, context):
             mark = "✓" if played else ""
             table.add_row(pod, title[:80], mark)
         console.print(table)
+
 
 def _playlist_play(args, context):
     console, _, _, db, _, _, pldb = _get_components(context)
@@ -335,10 +369,20 @@ def _playlist_play(args, context):
         console.rule(f"[bold green]Now playing:[/] {title}")
         sock_path = tempfile.NamedTemporaryFile(delete=True).name
         mpv_cmd = [
-            "mpv", f"--input-ipc-server={sock_path}", "--term-playing-msg=EOF",
-            "--force-window=no", "--quiet", "--no-video", f"--start={pos}" if pos else "", path
+            "mpv",
+            f"--input-ipc-server={sock_path}",
+            "--term-playing-msg=EOF",
+            "--force-window=no",
+            "--quiet",
+            "--no-video",
+            f"--start={pos}" if pos else "",
+            path,
         ]
-        mpv_proc = subprocess.Popen([arg for arg in mpv_cmd if arg], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        mpv_proc = subprocess.Popen(
+            [arg for arg in mpv_cmd if arg],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         position, finished = 0, False
 
         def monitor():
@@ -356,11 +400,15 @@ def _playlist_play(args, context):
                             data = client.recv(1024)
                             try:
                                 response = json.loads(data.decode())
-                                if "data" in response and isinstance(response["data"], (float, int)):
+                                if "data" in response and isinstance(
+                                    response["data"], (float, int)
+                                ):
                                     position = int(response["data"])
-                            except (json.JSONDecodeError, KeyError): pass
+                            except (json.JSONDecodeError, KeyError):
+                                pass
                             time.sleep(2)
-            except Exception: pass
+            except Exception:
+                pass
 
         thread = threading.Thread(target=monitor, daemon=True)
         thread.start()

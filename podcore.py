@@ -12,16 +12,11 @@ from typing import List
 from urllib.parse import urlparse
 
 import requests
-from rich.progress import (
-    BarColumn,
-    DownloadColumn,
-    Progress,
-    TextColumn,
-    TimeRemainingColumn,
-    TransferSpeedColumn,
-)
+from rich.progress import (BarColumn, DownloadColumn, Progress, TextColumn,
+                           TimeRemainingColumn, TransferSpeedColumn)
 
 # ─── Data Classes ──────────────────────────────────────────────────────
+
 
 @dataclass
 class Episode:
@@ -31,6 +26,7 @@ class Episode:
     description: str = ""
     duration: str = ""
 
+
 @dataclass
 class Podcast:
     name: str
@@ -38,7 +34,9 @@ class Podcast:
     directory: str
     episodes: List[Episode]
 
+
 # ─── Configuration ─────────────────────────────────────────────────────
+
 
 class PodConfig:
     def __init__(self, config_path="~/apps/podx-app/data/PodFile"):
@@ -87,7 +85,9 @@ class PodConfig:
         self.summaries[name] = summary
         self.save()
 
+
 # ─── Playlist Database ──────────────────────────────────────────────────
+
 
 class PlaylistDB:
     def __init__(self, db_path="~/apps/podx-app/data/.pod_playlists.db"):
@@ -167,7 +167,9 @@ class PlaylistDB:
                 (position, playlist, title),
             )
 
+
 # ─── Manifest Database ─────────────────────────────────────────────────
+
 
 class ManifestDB:
     def __init__(self, db_path="~/apps/podx-app/data/.pod_manifest.db"):
@@ -209,7 +211,9 @@ class ManifestDB:
                 ),
             )
 
+
 # ─── Queue Database ────────────────────────────────────────────────────
+
 
 class QueueDB:
     def __init__(self, db_path="~/apps/podx-app/data.pod_queue.db"):
@@ -252,7 +256,9 @@ class QueueDB:
         with self.conn:
             self.conn.execute("DELETE FROM queue")
 
+
 # ─── Podcast Fetching ──────────────────────────────────────────────────
+
 
 class PodcastFetcher:
     def __init__(self):
@@ -307,7 +313,9 @@ class PodcastFetcher:
             description,
         )
 
+
 # ─── Episode Downloader ────────────────────────────────────────────────
+
 
 class Downloader:
     def __init__(self, db: ManifestDB, console):
