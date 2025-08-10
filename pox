@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+Pod - CLI Podcast Manager with Progress Bars, Rename, Refresh, Search, Title Download, and Queue System
+"""
+import argparse
+from rich.console import Console
+
+# Import core components and command handlers
+from podcore import (
+    PodConfig,
+    PlaylistDB,
+    ManifestDB,
+    QueueDB,
+    PodcastFetcher,
+    Downloader,
+)
+import cmdcore as commands
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="pox",
+        description="CLI Podcast Manager"
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # --- System Commands ---
+    sub.add_parser("init", help="Initialize config directory and PodFile")
+    sub.add_parser("list-feeds", help="List all configured podcast feeds")
+
+    # --- Podcast Feed Management (Renamed for clarity) ---
+    sp_add = sub.add_parser("add-feed", help="Add a new podcast feed")
+    sp_add.add_argument("name", help="A short name for the podcast")
+    sp_add.add_argument("rss", help="The RSS feed URL")
+    sp_add.add_argument("-d", "--dir", dest="directory", help="Custom directory for downloads")
+
+    sp_remove = sub.add_parser("remove-feed", help="Remove a podcast feed")
+    sp_remove.add_argument("name")
+
+    sp_rename = sub.add_parser("rename-feed", help="Rename a podcast feed's short name")
+    sp_rename.add_argument("oldname")
+    sp_rename.add_argument("newname")
+
+    sp_refresh = sub.add_parser("refresh", help="Refresh episode list for a podcast")
+    sp_refresh.add_argument("name", nargs="?", help="Specific podcast to refresh (default: all)")
+
+    sp_info = sub.add_parser("info", help="Show detailed info about a podcast")
+    sp_info.add_argument("name")
+
+    sp_set_summary = sub.add_parser("set-summary", help="Set a custom podcast summary")
+    sp_set_summary.add_argument("name")
+    sp_set_summary.add_argument("summary", nargs="+")
+
+    sp_clean = sub.add_parser("clean", help="Clear all download records for a podcast")
+    sp_clean.add_argument("name")
+
+    # --- Downloading & Searching ---
+    sp_dl = sub.add_parser("download", help="Download episodes from a feed")
+    sp_dl.add_argument("name", help="Podcast to download from")
+    sp_dl.add_argument("-c", "--count", type=int, default=1, help="Number of latest episodes to download")
+    sp_dl.add_argument("--all", action="store_true", help="Download all episodes")
+
+    sp_dlt = sub.add_parser("download-title", help="Download a specific episode by title")
+    sp_dlt.add_argument("--pod", required=True, help="Podcast short name")
+    sp_dlt.add_argument("--title", required=True, help="Exact title of the episode")
+
+    sp_search = sub.add_parser("search", help="Search for episodes in a single podcast")
+    sp_search.add_argument("query")
+    sp_search.add_argument("--pod", dest="podcast", help="Limit search to one podcast")
+    sp_search.add_argument("--in", dest="field", choices=["title", "description"], default="title")
+
+    sp_search_all = sub.add_parser("search-all", help="Search for text across all episodes of all podcasts")
+    sp_search_all.add_argument("query", help="The text to search for (e.g., a guest's name)")
+
+    # --- Queue Management ---
+    sp_qadd = sub.add_parser("queue-add", help="Add an episode to the download queue")
+    sp_qadd.add_argument("--pod", required=True)
+    sp_qadd.add_argument("--title", required=True)
+    
+    sub.add_parser("queue-list", help="List all episodes in the download queue")
+    sub.add_parser("queue-download", help="Download all episodes in the queue and clear it")
+    
+    sp_qrm = sub.add_parser("queue-remove", help="Remove an episode from the queue")
+    sp_qrm.add_argument("--title", required=True)
+
+    sub.add_parser("queue-reset", help="Clear the download queue completely")
+
+    # --- Playlist Management ---
+    sp_pl = sub.add_parser("playlist", help="Manage playlists of downloaded episodes")
+    pl_sub = sp_pl.add_subparsers(dest="pl_cmd", required=True)
+    
+    pl_sub.add_parser("list", help="List all created playlists")
+    pl_create = pl_sub.add_parser("create", help="Create a new playlist")
+    pl_create.add_argument("name")
+    
+    pl_delete = pl_sub.add_parser("delete", help="Delete a playlist")
+    pl_delete.add_argument("name")
+    
+    pl_rename = pl_sub.add_parser("rename", help="Rename a playlist")
+    pl_rename.add_argument("old")
+    pl_rename.add_argument("new")
+    
+    pl_show = pl_sub.add_parser("show", help="Show a playlist's contents")
+    pl_show.add_argument("name")
+    
+    pl_add = pl_sub.add_parser("add", help="Add a downloaded episode to a playlist")
+    pl_add.add_argument("--pod", required=True, help="Podcast short name of the episode")
+    pl_add.add_argument("--title", required=True, help="Title of the downloaded episode")
+    pl_add.add_argument("--playlist", required=True, help="Name of the playlist")
+    
+    pl_play = pl_sub.add_parser("play", help="Play a playlist")
+    pl_play.add_argument("name")
+
+    args = parser.parse_args()
+
+    # --- Instantiate Core Components ---
+    console = Console()
+    cfg = PodConfig()
+    fetcher = PodcastFetcher()
+    db = ManifestDB()
+    downloader = Downloader(db, console)
+    qdb = QueueDB()
+    pldb = PlaylistDB()
+    
+    context = {
+        "console": console, "cfg": cfg, "fetcher": fetcher,
+        "db": db, "downloader": downloader, "qdb": qdb, "pldb": pldb,
+    }
+
+    # --- Map commands to handler functions ---
+    command_map = {
+        "init": commands.handle_init,
+        "add-feed": commands.handle_add,
+        "remove-feed": commands.handle_remove,
+        "list-feeds": commands.handle_list,
+        "rename-feed": commands.handle_rename,
+        "download": commands.handle_download,
+        "download-title": commands.handle_download_title,
+        "refresh": commands.handle_refresh,
+        "search": commands.handle_search,
+        "search-all": commands.handle_search_all,
+        "info": commands.handle_info,
+        "clean": commands.handle_clean,
+        "set-summary": commands.handle_set_summary,
+        "queue-add": commands.handle_queue_add,
+        "queue-list": commands.handle_queue_list,
+        "queue-download": commands.handle_queue_download,
+        "queue-remove": commands.handle_queue_remove,
+        "queue-reset": commands.handle_queue_reset,
+        "playlist": commands.handle_playlist,
+    }
+    
+    handler = command_map.get(args.cmd)
+    if handler:
+        handler(args, context)
+
+if __name__ == "__main__":
+    main()
