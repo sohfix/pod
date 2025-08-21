@@ -1,0 +1,649 @@
+# clipmix_tui.py
+# Textual TUI with real ffmpeg cuts, optional concat (xfade or gap), loudness, mono/CBR.
+# Run: python -m textual run clipmix_tui.py
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+import os
+import re
+import shutil
+import tempfile
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, Container, Grid
+from textual.widgets import (
+    Header, Footer, Static, Input, Label, Button, DataTable, DirectoryTree,
+    Select, Checkbox, Tabs, Tab, TabPane, TabbedContent, LoadingIndicator, Log,
+    ProgressBar
+)
+from textual.reactive import reactive
+
+APP_NAME = "ClipMix"
+CONFIG_DIR = Path.home() / ".config" / "clipmix"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+DEFAULT_CONFIG = {
+    "recent_files": [],
+    "output_dir": str((Path.home() / "ClipMixOutput").resolve()),
+    "encoding": {"cbr": None, "mono": False, "vbr_quality": 2},
+    "xfade": {"seconds": 1.0, "shape": "tri"},
+}
+
+TIME_HINT = "M:SS, H:MM:SS, or seconds"
+TIME_PATTERNS = [
+    re.compile(r"^(?P<m>\d+):(?P<s>[0-5]?\d)$"),                 # M:SS
+    re.compile(r"^(?P<h>\d+):(?P<m>[0-5]?\d):(?P<s>[0-5]?\d)$"), # H:MM:SS
+    re.compile(r"^(?P<s>\d+)$"),                                 # seconds
+]
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            pass
+    return json.loads(json.dumps(DEFAULT_CONFIG))
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+def parse_time(ts: str) -> float:
+    s = ts.strip()
+    for pat in TIME_PATTERNS:
+        m = pat.match(s)
+        if m:
+            h = int(m.groupdict().get("h") or 0)
+            m_ = int(m.groupdict().get("m") or 0)
+            s_ = int(m.groupdict().get("s") or 0)
+            return float(h * 3600 + m_ * 60 + s_)
+    raise ValueError(f"Invalid time format: {ts!r} (use {TIME_HINT})")
+
+def sanitize_filename(name: str) -> str:
+    return "".join("_" if c in '\\/:*?"<>|' else c for c in name).strip()
+
+def enc_args(cbr: Optional[str], mono: bool, vbr_q: int = 2) -> List[str]:
+    args = ["-acodec", "libmp3lame"]
+    if cbr:
+        args += ["-b:a", str(cbr)]
+    else:
+        args += ["-q:a", str(vbr_q)]
+    if mono:
+        args += ["-ac", "1"]
+    return args
+
+# -------------------------- Job system --------------------------
+
+@dataclass
+class Job:
+    title: str
+    cmd: List[str]
+    total_ms: Optional[int] = None
+    progress: float = 0.0
+    status: str = "queued"    # queued, running, done, error, cancelled
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    log_lines: List[str] = field(default_factory=list)
+    allow_cancel: bool = True
+    # runtime:
+    _proc: Optional[asyncio.subprocess.Process] = field(default=None, init=False, repr=False)
+
+class JobQueue:
+    """Runs cut jobs concurrently, then merge job after all cuts succeed."""
+    def __init__(self, app_log: Log, max_parallel: int = 3) -> None:
+        self.app_log = app_log
+        self.max_parallel = max_parallel
+        self.jobs: List[Job] = []
+        self._sem = asyncio.Semaphore(max_parallel)
+
+    def add(self, job: Job) -> Job:
+        self.jobs.append(job)
+        return job
+
+    def add_many(self, jobs: List[Job]) -> None:
+        self.jobs.extend(jobs)
+
+    async def run_all(self, on_update: Callable[[Job], None]) -> None:
+        # run all "cut" jobs concurrently; merge runs last if present
+        cuts = [j for j in self.jobs if not j.title.startswith("MERGE")]
+        merges = [j for j in self.jobs if j.title.startswith("MERGE")]
+
+        async def _run_job(job: Job):
+            async with self._sem:
+                await self._exec(job, on_update)
+
+        # run cuts
+        await asyncio.gather(*[_run_job(j) for j in cuts])
+
+        # if any cut failed, skip merges
+        if any(j.status == "error" for j in cuts):
+            self.app_log.write("[error]One or more cuts failed. Skipping merge.")
+            return
+
+        # run merges sequentially (usually 1)
+        for m in merges:
+            await self._exec(m, on_update)
+
+    async def _exec(self, job: Job, on_update: Callable[[Job], None]) -> None:
+        job.status = "running"
+        on_update(job)
+        try:
+            # We use -progress pipe:1 so progress is on STDOUT
+            job.log_lines.append(" ".join(job.cmd))
+            self.app_log.write(f"[dim]{job.title}[/] → {job.cmd[0]} …")
+            job._proc = await asyncio.create_subprocess_exec(
+                *job.cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            async def read_stdout():
+                if not job._proc or not job._proc.stdout:
+                    return
+                async for raw in job._proc.stdout:
+                    line = raw.decode(errors="ignore").strip()
+                    if not line:
+                        continue
+                    # ffmpeg -progress key=value lines
+                    if line.startswith("out_time_ms="):
+                        try:
+                            cur_ms = int(line.split("=", 1)[1])
+                            if job.total_ms and job.total_ms > 0:
+                                job.progress = min(0.999, cur_ms / job.total_ms)
+                                on_update(job)
+                        except Exception:
+                            pass
+                    elif line.startswith("progress=") and "end" in line:
+                        job.progress = 1.0
+                        on_update(job)
+                    else:
+                        # occasional non-progress output
+                        pass
+
+            async def read_stderr():
+                if not job._proc or not job._proc.stderr:
+                    return
+                async for raw in job._proc.stderr:
+                    line = raw.decode(errors="ignore").rstrip()
+                    if line:
+                        job.log_lines.append(line)
+                        # Don't spam the app log; keep lines per job
+
+            await asyncio.gather(read_stdout(), read_stderr())
+            rc = await job._proc.wait()
+            if rc == 0:
+                job.progress = 1.0
+                job.status = "done"
+            else:
+                job.status = "error"
+                job.log_lines.append(f"ffmpeg exited with code {rc}")
+            on_update(job)
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            if job._proc:
+                with contextlib.suppress(ProcessLookupError):
+                    job._proc.kill()
+            on_update(job)
+        except Exception as e:
+            job.status = "error"
+            job.log_lines.append(f"Exception: {e}")
+            on_update(job)
+
+# -------------------------- TUI --------------------------
+
+class ClipMixApp(App):
+    CSS = """
+    Screen { layout: vertical; }
+    #topbar { height: 3; background: $panel; padding: 0 1; }
+    #body { height: 1fr; }
+    #left { width: 36%; min-width: 34; border-right: solid $panel 1; }
+    #right { width: 1fr; }
+    .card { border: round $primary; padding: 1 2; background: $boost; }
+    .toolbar { height: 3; content-align: left middle; padding: 0 1; column-gap: 1; }
+    DataTable { height: 1fr; border: tall $accent; }
+    DirectoryTree { height: 1fr; border: tall $accent; }
+    #log_panel { height: 12; border-top: solid $panel 1; }
+    .queue_row { padding: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("?", "help", "Help"),
+        Binding("f10", "export", "Export"),
+        Binding("tab", "focus_next", "Next"),
+        Binding("shift+tab", "focus_previous", "Prev"),
+        Binding("ctrl+s", "save_config", "Save Config"),
+        Binding("ctrl+r", "reload_config", "Reload Config"),
+    ]
+
+    current_file: reactive[Optional[Path]] = reactive(None)
+    exporting: reactive[bool] = reactive(False)
+
+    def compose(self) -> ComposeResult:
+        # Top
+        with Horizontal(id="topbar"):
+            yield Label(f" {APP_NAME} ", id="title")
+            yield Static("", id="status_right", expand=True)
+
+        # Body split
+        with Horizontal(id="body"):
+            with Vertical(id="left"):
+                yield Static("Audio Explorer", classes="card")
+                yield DirectoryTree(Path.home(), id="tree")
+                with Container(classes="toolbar"):
+                    yield Input(placeholder="Filter… (not implemented)", id="filter")
+                    yield Button("Load Selected", id="load_btn", variant="primary")
+                yield Static("Recent Files", classes="card")
+                self.recent = DataTable(zebra_stripes=True, id="recent")
+                yield self.recent
+
+            with Vertical(id="right"):
+                yield TabbedContent(
+                    TabPane(self._compose_clips_tab(), id="clips_tab", title="Clips"),
+                    TabPane(self._compose_mix_tab(),   id="mix_tab",   title="Mix"),
+                    TabPane(self._compose_output_tab(),id="output_tab",title="Output"),
+                    TabPane(self._compose_queue_tab(), id="queue_tab", title="Queue"),
+                )
+
+        with Vertical(id="log_panel"):
+            self.log = Log(highlight=True, wrap=True)
+            yield self.log
+            yield Footer()
+
+    # ---------- Tabs ----------
+
+    def _compose_clips_tab(self) -> Container:
+        header = Static("No file loaded", id="file_label", classes="card")
+        controls = Container(
+            Button("Add", id="clip_add", variant="success"),
+            Button("Edit", id="clip_edit"),
+            Button("Delete", id="clip_del", variant="error"),
+            Button("Toggle Include", id="clip_toggle"),
+            classes="toolbar",
+        )
+        self.table = DataTable(id="clips_table", zebra_stripes=True)
+        self.table.add_columns("✓", "Start", "End", "Name", "Description")
+        form = Grid(
+            Label("Start:"), Input(placeholder=TIME_HINT, id="in_start"),
+            Label("End:"),   Input(placeholder=TIME_HINT, id="in_end"),
+            Label("Name:"),  Input(placeholder="filename (no .mp3)", id="in_name"),
+            Label("Desc:"),  Input(placeholder="description (#default for default)", id="in_desc"),
+            classes="card",
+        )
+        return Vertical(header, self.table, controls, form)
+
+    def _compose_mix_tab(self) -> Container:
+        grid = Grid(
+            Label("Concat:"), Checkbox(value=True, id="opt_concat"),
+            Label("Crossfade (s):"), Input(value="1.0", id="opt_xfade"),
+            Label("Shape:"), Select(id="opt_shape",
+                options=[("Tri","tri"),("Log","log"),("Exp","exp"),("Qsin","qsin")], value="tri"),
+            Label("Gap (s):"), Input(value="0.0", id="opt_gap"),
+            Label("Loudnorm LUFS:"), Input(placeholder="-16 for podcasts (blank=off)", id="opt_lufs"),
+            Label("Mono:"), Checkbox(value=False, id="opt_mono"),
+            Label("CBR:"), Select(id="opt_cbr",
+                options=[("VBR q=2",""),("128k","128k"),("192k","192k"),("256k","256k")], value=""),
+            classes="card",
+        )
+        actions = Container(
+            Button("Export (F10)", id="do_export", variant="primary"),
+            classes="toolbar",
+        )
+        return Vertical(grid, actions)
+
+    def _compose_output_tab(self) -> Container:
+        cfg = load_config()
+        out_dir = cfg.get("output_dir", DEFAULT_CONFIG["output_dir"])
+        grid = Grid(
+            Label("Output Directory:"), Input(value=out_dir, id="out_dir"),
+            Label("Keep Individual Clips:"), Checkbox(value=False, id="opt_keep_parts"),
+            Label("Edge Fade (s):"), Input(value="0.02", id="opt_edgefade"),
+            classes="card",
+        )
+        return Vertical(grid)
+
+    def _compose_queue_tab(self) -> Container:
+        # Simple queue list with per-job progress bars (rendered dynamically)
+        self.queue_container = Vertical(classes="card")
+        return self.queue_container
+
+    # ---------- Lifecycle ----------
+
+    def on_mount(self) -> None:
+        self.recent.add_columns("Recent MP3s")
+        for f in load_config().get("recent_files", []):
+            self.recent.add_row(f)
+        self.query_one("#tree", DirectoryTree).focus()
+
+    # ---------- UI Events ----------
+
+    async def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        path = Path(event.path)
+        if path.suffix.lower() != ".mp3":
+            self.log.write(f"[warning]Unsupported file type: {path.name}")
+            return
+        self.current_file = path
+        self.query_one("#file_label", Static).update(f"[b]Loaded:[/b] {self.current_file}")
+        self._add_recent(str(path))
+        if self.table.row_count == 0:
+            self.table.add_row("✓", "3:55", "4:55", "hot_take", "#default")
+            self.table.add_row(" ", "2:35", "3:33", "funny_bit", "Hosts crack up")
+            self.table.add_row("✓", "420", "505", "", "")
+
+    def _add_recent(self, path: str) -> None:
+        cfg = load_config()
+        lst = [p for p in cfg.get("recent_files", []) if p != path]
+        lst.insert(0, path)
+        cfg["recent_files"] = lst[:10]
+        save_config(cfg)
+        self.recent.clear()
+        for p in cfg["recent_files"]:
+            self.recent.add_row(p)
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "load_btn":
+            tree = self.query_one("#tree", DirectoryTree)
+            if tree.cursor_node and tree.cursor_node.data.path:
+                await self.on_directory_tree_file_selected(
+                    DirectoryTree.FileSelected(tree, tree.cursor_node.data.path)
+                )
+        elif bid == "clip_add":
+            await self._add_clip()
+        elif bid == "clip_edit":
+            await self._edit_clip()
+        elif bid == "clip_del":
+            self._del_clip()
+        elif bid == "clip_toggle":
+            self._toggle_include()
+        elif bid == "do_export":
+            await self.action_export()
+
+    async def _add_clip(self) -> None:
+        start = self.query_one("#in_start", Input).value.strip()
+        end   = self.query_one("#in_end", Input).value.strip()
+        name  = sanitize_filename(self.query_one("#in_name", Input).value.strip())
+        desc  = self.query_one("#in_desc", Input).value.strip()
+        if not start or not end:
+            self.log.write("[error]Start and End are required")
+            return
+        self.table.add_row("✓", start, end, name, desc or "#default")
+        self.log.write(f"Added clip {start}-{end} {name or '(auto)'}")
+
+    async def _edit_clip(self) -> None:
+        if self.table.cursor_row is None:
+            self.log.write("[warning]No row selected")
+            return
+        r = self.table.cursor_row
+        def val(i, default):
+            v = self.query_one(i, Input).value.strip()
+            return v if v else default
+        self.table.update_cell_at((r,1), val("#in_start", self.table.get_cell_at((r,1))))
+        self.table.update_cell_at((r,2), val("#in_end",   self.table.get_cell_at((r,2))))
+        self.table.update_cell_at((r,3), sanitize_filename(val("#in_name", self.table.get_cell_at((r,3)))))
+        self.table.update_cell_at((r,4), val("#in_desc",  self.table.get_cell_at((r,4))))
+        self.log.write(f"Edited row {r+1}")
+
+    def _del_clip(self) -> None:
+        if self.table.cursor_row is None:
+            self.log.write("[warning]No row selected")
+            return
+        self.table.remove_row(self.table.cursor_row)
+        self.log.write("Deleted selected row")
+
+    def _toggle_include(self) -> None:
+        if self.table.cursor_row is None:
+            self.log.write("[warning]No row selected")
+            return
+        r = self.table.cursor_row
+        v = str(self.table.get_cell_at((r,0))).strip()
+        self.table.update_cell_at((r,0), " " if v == "✓" else "✓")
+
+    # ---------- Actions ----------
+
+    def action_help(self) -> None:
+        self.log.write("[b]Keys[/b]: TAB/Shift+TAB to move • ↑/↓ in tables • SPACE toggle include • F10 Export • Ctrl+S save defaults")
+
+    def action_save_config(self) -> None:
+        cfg = load_config()
+        cfg["output_dir"] = self.query_one("#out_dir", Input).value.strip() or cfg["output_dir"]
+        cfg["encoding"]["cbr"] = (self.query_one("#opt_cbr", Select).value or None)
+        cfg["encoding"]["mono"] = self.query_one("#opt_mono", Checkbox).value
+        cfg["xfade"]["seconds"] = float(self.query_one("#opt_xfade", Input).value or 1.0)
+        cfg["xfade"]["shape"] = self.query_one("#opt_shape", Select).value or "tri"
+        save_config(cfg)
+        self.log.write("[success]Saved defaults")
+
+    def action_reload_config(self) -> None:
+        cfg = load_config()
+        self.query_one("#out_dir", Input).value = cfg.get("output_dir", DEFAULT_CONFIG["output_dir"])
+        self.query_one("#opt_mono", Checkbox).value = cfg["encoding"].get("mono", False)
+        self.query_one("#opt_cbr", Select).value = cfg["encoding"].get("cbr") or ""
+        self.query_one("#opt_xfade", Input).value = str(cfg["xfade"].get("seconds", 1.0))
+        self.query_one("#opt_shape", Select).value = cfg["xfade"].get("shape", "tri")
+        self.log.write("[success]Reloaded defaults")
+
+    async def action_export(self) -> None:
+        if self.exporting:
+            return
+        if not self.current_file:
+            self.log.write("[error]No input file loaded.")
+            return
+
+        # gather selected clips
+        rows = []
+        for r in range(self.table.row_count):
+            include = str(self.table.get_cell_at((r,0))).strip() == "✓"
+            if not include:
+                continue
+            start = str(self.table.get_cell_at((r,1))).strip()
+            end   = str(self.table.get_cell_at((r,2))).strip()
+            name  = sanitize_filename(str(self.table.get_cell_at((r,3))).strip() or f"clip_{r+1:02d}")
+            desc  = str(self.table.get_cell_at((r,4))).strip()
+            try:
+                ss = parse_time(start); ee = parse_time(end)
+            except ValueError as e:
+                self.log.write(f"[error]{e}")
+                return
+            if ee <= ss:
+                self.log.write(f"[error]End must be greater than start: {start}–{end}")
+                return
+            rows.append((ss, ee, name, desc))
+
+        if not rows:
+            self.log.write("[warning]Nothing to export (no included rows).")
+            return
+
+        # read options
+        out_dir = Path(self.query_one("#out_dir", Input).value.strip() or load_config()["output_dir"])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        concat = self.query_one("#opt_concat", Checkbox).value
+        keep_parts = self.query_one("#opt_keep_parts", Checkbox).value
+        edge_fade = float(self.query_one("#opt_edgefade", Input).value or 0.0)
+        xfade = float(self.query_one("#opt_xfade", Input).value or 0.0)
+        gap = float(self.query_one("#opt_gap", Input).value or 0.0)
+        lufs_text = self.query_one("#opt_lufs", Input).value.strip()
+        loudnorm = float(lufs_text) if lufs_text else None
+        mono = self.query_one("#opt_mono", Checkbox).value
+        cbr  = self.query_one("#opt_cbr", Select).value or None
+        shape = self.query_one("#opt_shape", Select).value or "tri"
+
+        # build job queue
+        self.exporting = True
+        self.log.write("[b]Building job queue…[/b]")
+        queue = JobQueue(self.log, max_parallel=3)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="clipmix_", dir=str(out_dir)))
+        part_paths: List[Path] = []
+
+        # cut jobs
+        input_file = str(self.current_file)
+        for i, (ss, ee, name, desc) in enumerate(rows, 1):
+            if concat:
+                out_path = tmp_dir / f"part_{i:02d}.mp3"
+            else:
+                out_path = out_dir / f"{name}.mp3"
+
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+                "-progress", "pipe:1",
+                "-ss", f"{ss:.3f}", "-t", f"{(ee-ss):.3f}",
+                "-i", input_file,
+            ]
+
+            # edge fade means re-encode; else we can stream copy
+            if edge_fade > 0 or cbr or mono:
+                af = []
+                if edge_fade > 0:
+                    st_out = max(0.0, (ee-ss) - edge_fade)
+                    af.append(f"afade=t=in:st=0:d={edge_fade}")
+                    af.append(f"afade=t=out:st={st_out:.3f}:d={edge_fade}")
+                if af:
+                    cmd += ["-af", ",".join(af)]
+                cmd += enc_args(cbr=cbr, mono=False)  # parts are left stereo; downmix at final if requested
+            else:
+                cmd += ["-c", "copy"]
+
+            cmd += ["-metadata", f"title={name}", "-metadata", f"comment={desc or ''}", str(out_path)]
+
+            job = Job(
+                title=f"CUT {i:02d} {name}",
+                cmd=cmd,
+                total_ms=int((ee-ss) * 1000),
+            )
+            queue.add(job)
+            part_paths.append(out_path)
+
+        # merge job if requested
+        if concat:
+            # If both provided, prefer xfade
+            if xfade > 0 and len(part_paths) >= 2:
+                # filter_complex acrossfade chain
+                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
+                for p in part_paths:
+                    cmd += ["-i", str(p)]
+                filters = []
+                prev = "0:a"
+                for i in range(1, len(part_paths)):
+                    cur = f"{i}:a"
+                    out = f"af{i}"
+                    filters.append(f"[{prev}][{cur}]acrossfade=d={xfade}:c1={shape}:c2={shape}[{out}]")
+                    prev = out
+                final_label = prev
+                # limiter and optional loudnorm
+                filters.append(f"[{final_label}]alimiter=limit=0.90[lim]")
+                final_label = "lim"
+                if loudnorm is not None:
+                    filters.append(f"[{final_label}]loudnorm=I={loudnorm}:TP=-1.5:LRA=11[ln]")
+                    final_label = "ln"
+
+                merged_name = f"{self.current_file.stem}_highlights"
+                merged_out = out_dir / f"{merged_name}.mp3"
+                cmd += ["-filter_complex", ";".join(filters), "-map", f"[{final_label}]"]
+                cmd += enc_args(cbr=cbr, mono=mono)
+                cmd += ["-metadata", f"title={merged_name}", str(merged_out)]
+
+                # estimate total: sum(durations) - xfade*(n-1)
+                total_ms = max(1, int(sum((ee-ss) for ss,ee,_,_ in rows)*1000 - xfade*1000*(len(rows)-1)))
+                queue.add(Job(title="MERGE xfade", cmd=cmd, total_ms=total_ms))
+            else:
+                # concat demuxer, with optional gaps (silence files)
+                list_file = tmp_dir / "concat.txt"
+                parts_for_concat = list(part_paths)
+                if gap > 0 and len(parts_for_concat) >= 2:
+                    # interleave generated silence files
+                    inter: List[Path] = []
+                    for idx, p in enumerate(parts_for_concat):
+                        inter.append(p)
+                        if idx < len(parts_for_concat) - 1:
+                            sfile = tmp_dir / f"silence_{idx:02d}.mp3"
+                            # generate silence (stereo; downmix later if requested)
+                            scmd = [
+                                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-t", f"{gap:.3f}",
+                                "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                                *enc_args(cbr=cbr, mono=False),
+                                str(sfile)
+                            ]
+                            queue.add(Job(title=f"SILENCE {idx:02d}", cmd=scmd, total_ms=int(gap*1000)))
+                            inter.append(sfile)
+                    parts_for_concat = inter
+
+                # The concat itself (may re-encode for limiter/mono/CBR)
+                with list_file.open("w", encoding="utf-8") as lf:
+                    for p in parts_for_concat:
+                        lf.write(f"file '{p.as_posix()}'\n")
+
+                merged_name = f"{self.current_file.stem}_highlights"
+                merged_out = out_dir / f"{merged_name}.mp3"
+                cmd = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+                    "-progress", "pipe:1",
+                    "-f", "concat", "-safe", "0", "-i", str(list_file)
+                ]
+                # post filter on final
+                filter_chain = ["alimiter=limit=0.90"]
+                if loudnorm is not None:
+                    filter_chain.append(f"loudnorm=I={loudnorm}:TP=-1.5:LRA=11")
+                if filter_chain:
+                    cmd += ["-filter:a", ",".join(filter_chain)]
+                # If any filter/mono/CBR requested, encode, else copy
+                must_encode = bool(filter_chain) or mono or bool(cbr)
+                if must_encode:
+                    cmd += enc_args(cbr=cbr, mono=mono)
+                else:
+                    cmd += ["-c", "copy"]
+                cmd += ["-metadata", f"title={merged_name}", str(merged_out)]
+                total_ms = max(1, int(sum((ee-ss) for ss,ee,_,_ in rows)*1000 + max(0,gap)*1000*(len(rows)-1)))
+                queue.add(Job(title="MERGE concat", cmd=cmd, total_ms=total_ms))
+
+        # UI: render queue rows with progress bars
+        self.queue_container.clear()
+        self.job_widgets: dict[str, Tuple[Static, ProgressBar, Static]] = {}  # id -> (label, bar, status)
+        for j in queue.jobs:
+            row = Horizontal(classes="queue_row")
+            label = Static(f"{j.title} [{j.id}]", expand=True)
+            bar = ProgressBar(total=100)
+            status = Static(j.status, classes="status")
+            row.mount(label)
+            row.mount(bar)
+            row.mount(status)
+            self.queue_container.mount(row)
+            self.job_widgets[j.id] = (label, bar, status)
+
+        def on_update(job: Job):
+            label, bar, status = self.job_widgets[job.id]
+            bar.update(int(job.progress * 100))
+            status.update(job.status)
+
+        # run jobs
+        await queue.run_all(on_update)
+
+        # clean up temp dir unless keeping parts
+        if concat and not keep_parts:
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        # write logs of failed jobs
+        for j in queue.jobs:
+            if j.status == "error":
+                self.log.write(f"[error]{j.title} failed:")
+                for ln in j.log_lines[-10:]:
+                    self.log.write(f"[dim]{ln}[/dim]")
+
+        self.log.write("[success]Export pipeline finished.")
+        self.exporting = False
+
+if __name__ == "__main__":
+    # quick ffmpeg presence check
+    if not shutil.which("ffmpeg"):
+        print("Error: ffmpeg not found on PATH. Please install ffmpeg.", flush=True)
+        raise SystemExit(1)
+    ClipMixApp().run()
