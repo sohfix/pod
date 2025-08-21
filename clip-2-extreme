@@ -1,13 +1,95 @@
 #!/usr/bin/env python3
-import argparse, csv, json, os, re, subprocess, sys, tempfile
+"""
+podmix — cut podcast clips; batch, concat, crossfade, gaps, loudness.
+
+Quick examples:
+  # Single clip with safe edges
+  podmix -i INPUT.mp3 --start 3:50 --end 4:50 --name intro --edge-fade 0.02
+
+  # Batch (CSV) → individual files
+  podmix -i INPUT.mp3 -f clips.csv
+
+  # Batch → one highlight reel with 1.0s crossfades + loudness target
+  podmix -i INPUT.mp3 -f clips.csv --concat --name highlight_reel --xfade 1.0 --loudnorm -16
+
+  # Set a default output directory
+  podmix set --output-default ~/PodmixClips
+"""
+import argparse, csv, json, os, re, subprocess, sys, tempfile, textwrap
 from pathlib import Path
 from typing import Optional, Tuple, List
 
-APP_NAME = "podmix"
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_NAME
-CONFIG_PATH = CONFIG_DIR / "config.json"
+APP_NAME   = "podmix"
+APP_DESC   = "Cut podcast clips from MP3s; batch, concat, crossfade, gaps, loudness."
+APP_VER    = "1.5.0"
 
-# ---------------- Utilities ----------------
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_NAME
+CONFIG_PATH= CONFIG_DIR / "config.json"
+
+# ---------- Help & UX ----------
+
+class _SmartFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
+    """Shows defaults + preserves newlines/indent."""
+    pass
+
+def _dedent(s: str) -> str:
+    return textwrap.dedent(s).strip("\n")
+
+EXAMPLES_TEXT = _dedent("""
+General:
+  podmix --help
+  podmix --version
+  podmix --examples
+  podmix help run
+  podmix help set
+
+Single clip:
+  podmix -i INPUT.mp3 --start "3:50" --end "4:50" --name intro
+  podmix -i INPUT.mp3 --start 235 --end 300 --name funny_bit --edge-fade 0.02
+  podmix -i INPUT.mp3 --start 3:55 --end 4:55 --name teaser --mono --cbr 192k
+
+Batch (CSV format):
+  # clips.csv
+  #default, Highlights from the episode
+  start,end,name,description
+  3:55,4:55,hot_take,#default
+  2:35,3:33,funny_bit,Hosts crack up
+  420,505,,
+
+  podmix -i INPUT.mp3 -f clips.csv
+
+Concat (one highlight reel):
+  podmix -i INPUT.mp3 -f clips.csv --concat --name highlight_reel
+
+Concat + crossfade + loudness:
+  podmix -i INPUT.mp3 -f clips.csv --concat --name highlight_reel --xfade 1.0 --loudnorm -16
+
+Concat + gaps (no crossfade):
+  podmix -i INPUT.mp3 -f clips.csv --concat --gap 0.25 --name teaser_mix
+
+Keep the cut parts too:
+  podmix -i INPUT.mp3 -f clips.csv --concat --xfade 1.0 --keep-clips
+
+Set defaults:
+  podmix set --output-default ~/PodmixClips
+""")
+
+def print_examples_and_exit():
+    print(EXAMPLES_TEXT)
+    sys.exit(0)
+
+def print_topic_help_and_exit(parser: argparse.ArgumentParser, topic: Optional[str]):
+    # topic can be "run" or "set" or None
+    if not topic or topic.lower() not in {"run", "set"}:
+        parser.print_help()
+        sys.exit(0)
+    # find the subparser by name and print its help
+    subparsers_action = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    sp = subparsers_action.choices[topic.lower()]
+    sp.print_help()
+    sys.exit(0)
+
+# ---------- Utilities ----------
 
 TIME_PATTERNS = [
     re.compile(r"^(?P<m>\d+):(?P<s>[0-5]?\d)$"),                 # M:SS
@@ -24,7 +106,7 @@ def parse_time(ts: str) -> float:
             m_ = int(m.groupdict().get("m") or 0)
             s_ = int(m.groupdict().get("s") or 0)
             return h * 3600 + m_ * 60 + s_
-    raise ValueError(f"Invalid time format: {ts!r}")
+    raise ValueError(f"Invalid time format: {ts!r}  (use M:SS, H:MM:SS, or seconds)")
 
 def load_config() -> dict:
     if CONFIG_PATH.exists():
@@ -37,6 +119,13 @@ def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
 def ensure_outdir(path: Optional[str], cfg: dict) -> Path:
+    """
+    Resolves the output directory in priority:
+      1) --output
+      2) configured default (podmix set --output-default DIR)
+      3) current directory
+    Creates the directory if missing.
+    """
     outdir = Path(path) if path else Path(cfg.get("output_default", "."))
     outdir.mkdir(parents=True, exist_ok=True)
     return outdir
@@ -46,8 +135,8 @@ def sanitize_filename(name: str) -> str:
 
 def choose_encode_args(cbr: Optional[str], mono: bool) -> List[str]:
     """
-    Return ffmpeg audio encode args for final renders (or parts when re-encoding).
-    Default: VBR -q:a 2. If cbr is like '192k', use -b:a 192k.
+    Audio encode args for final renders (or parts when re-encoding).
+    Default: VBR -q:a 2. If cbr like '192k', use -b:a 192k. --mono downmixes.
     """
     args = ["-acodec", "libmp3lame"]
     if cbr:
@@ -58,7 +147,7 @@ def choose_encode_args(cbr: Optional[str], mono: bool) -> List[str]:
         args += ["-ac", "1"]
     return args
 
-# ---------------- Cutting & helpers ----------------
+# ---------- Cutting & parsing ----------
 
 def run_ffmpeg_cut(
     input_mp3: Path,
@@ -72,8 +161,8 @@ def run_ffmpeg_cut(
     cbr: Optional[str] = None,
 ) -> None:
     """
-    Cut a segment. If edge_fade>0, we apply tiny afade in/out (requires re-encode).
-    If copy=True and edge_fade>0, we ignore edge_fade to preserve copy (warn via print).
+    Cut a segment from input. If edge_fade>0, apply tiny fades to prevent clicks (re-encode).
+    If copy=True and edge_fade>0 or cbr set, copy is ignored (we re-encode).
     """
     if end_s <= start_s:
         raise ValueError("end must be greater than start")
@@ -83,30 +172,25 @@ def run_ffmpeg_cut(
     if title:   meta += ["-metadata", f"title={title}"]
     if comment: meta += ["-metadata", f"comment={comment}"]
 
-    # Build base command
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ss", f"{start_s:.3f}", "-t", f"{duration:.3f}",
         "-i", str(input_mp3),
     ]
 
-    # Decide codec/filter
-    if copy and edge_fade <= 0:
+    if copy and edge_fade <= 0 and not cbr:
         codec_args = ["-c", "copy"]
         filter_args: List[str] = []
     else:
-        # re-encode path
         codec_args = choose_encode_args(cbr=cbr, mono=False)
         filter_chain = []
         if edge_fade > 0:
-            # Fade in from 0, fade out starting at duration-edge_fade
             st_out = max(0.0, duration - edge_fade)
             filter_chain.append(f"afade=t=in:st=0:d={edge_fade}")
             filter_chain.append(f"afade=t=out:st={st_out:.3f}:d={edge_fade}")
         filter_args = ["-af", ",".join(filter_chain)] if filter_chain else []
-
-        if copy and edge_fade > 0:
-            print(f"note: --copy ignored for {out_path.name} because --edge-fade requires re-encode")
+        if copy and (edge_fade > 0 or cbr):
+            print(f"note: re-encoding {out_path.name} (copy disabled by --edge-fade/--cbr)")
 
     cmd += filter_args + codec_args + meta + [str(out_path)]
     if subprocess.run(cmd).returncode != 0:
@@ -160,12 +244,10 @@ def derive_outfile(base_dir: Path, base_name: Optional[str], idx: int) -> Path:
     stem = sanitize_filename(base_name) if base_name else f"clip_{idx:02d}"
     return base_dir / f"{stem}.mp3"
 
-# ---------------- Concat helpers ----------------
+# ---------- Concat helpers ----------
 
 def make_silence_mp3(path: Path, duration: float, cbr: Optional[str], mono: bool) -> None:
-    """
-    Create a silent MP3 of given duration (seconds) using anullsrc.
-    """
+    """Create a silent MP3 of given duration (seconds) using anullsrc."""
     if duration <= 0:
         return
     cmd = [
@@ -181,14 +263,13 @@ def make_silence_mp3(path: Path, duration: float, cbr: Optional[str], mono: bool
 def build_xfade_filter(n_parts: int, xfade: float, shape: str,
                        add_limiter: bool, loudnorm_i: Optional[float]) -> Tuple[str, str]:
     """
-    Returns (filter_complex, final_label). Chains acrossfade over N inputs.
-    After last fade, optionally applies limiter and loudnorm on the labeled stream.
+    Build a filter_complex acrossfade chain.
+    Returns (filter_complex, final_label).
     """
     if n_parts == 1:
-        # No acrossfade needed; we'll apply post-filters separately outside if desired.
         return "", "0:a"
 
-    shape = shape.lower()
+    shape = (shape or "tri").lower()
     if shape not in {"tri", "exp", "log", "qsin"}:
         shape = "tri"
 
@@ -201,14 +282,10 @@ def build_xfade_filter(n_parts: int, xfade: float, shape: str,
         prev = out
 
     final_label = prev
-
-    # Post-filters: limiter then loudness, in that order
     if add_limiter:
         filters.append(f"[{final_label}]alimiter=limit=0.90[lim]")
         final_label = "lim"
-
     if loudnorm_i is not None:
-        # Simple one-pass loudnorm; TP ≈ -1.5 dB, typical LRA
         filters.append(f"[{final_label}]loudnorm=I={loudnorm_i}:TP=-1.5:LRA=11[ln]")
         final_label = "ln"
 
@@ -218,8 +295,7 @@ def ffmpeg_concat_list(list_file: Path, out_path: Path, copy: bool,
                        title: Optional[str], comment: Optional[str],
                        filter_a: Optional[str], cbr: Optional[str], mono: bool) -> None:
     """
-    Concat demuxer path. If filter_a is provided or mono/cbr needs encoding,
-    we re-encode with libmp3lame; otherwise we stream copy.
+    Concat demuxer path. If filter_a provided or mono/cbr requested, we re-encode; else stream copy.
     """
     meta = []
     if title:   meta += ["-metadata", f"title={title}"]
@@ -248,39 +324,31 @@ def ffmpeg_concat_xfade(parts: List[Path], out_path: Path, xfade: float, shape: 
     Multi-input, filter_complex acrossfade with optional limiter/loudnorm.
     Always re-encodes the final output.
     """
-    # Build command
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
     for p in parts:
         cmd += ["-i", str(p)]
 
     filter_complex, final_label = build_xfade_filter(
-        n_parts=len(parts),
-        xfade=xfade,
-        shape=shape,
-        add_limiter=add_limiter,
-        loudnorm_i=loudnorm_i
+        n_parts=len(parts), xfade=xfade, shape=shape,
+        add_limiter=add_limiter, loudnorm_i=loudnorm_i
     )
 
-    # If only one input, we may not have a filter_complex; handle mapping accordingly
-    map_args = []
     if filter_complex:
-        cmd += ["-filter_complex", filter_complex]
-        map_args = ["-map", f"[{final_label}]"]
+        cmd += ["-filter_complex", filter_complex, "-map", f"[{final_label}]"]
     else:
-        map_args = ["-map", "0:a"]
+        cmd += ["-map", "0:a"]
 
-    cmd += map_args + choose_encode_args(cbr=cbr, mono=mono)
-
+    cmd += choose_encode_args(cbr=cbr, mono=mono)
     if title:   cmd += ["-metadata", f"title={title}"]
     if comment: cmd += ["-metadata", f"comment={comment}"]
-
     cmd += [str(out_path)]
     if subprocess.run(cmd).returncode != 0:
         raise RuntimeError(f"ffmpeg xfade failed for {out_path.name}")
 
-# ---------------- Commands ----------------
+# ---------- Commands ----------
 
 def cmd_set(args):
+    """Implements `podmix set`."""
     cfg = load_config()
     if args.output_default:
         cfg["output_default"] = str(Path(args.output_default).expanduser())
@@ -288,7 +356,11 @@ def cmd_set(args):
         print(f"Set output default to: {cfg['output_default']}")
 
 def cmd_run(args):
+    """Implements `podmix run` (default)."""
     cfg = load_config()
+    if args.examples:
+        print_examples_and_exit()
+
     if not args.input:
         print("error: -i/--input is required", file=sys.stderr); sys.exit(2)
     input_mp3 = Path(args.input).expanduser()
@@ -301,7 +373,7 @@ def cmd_run(args):
         start_s = parse_time(args.start); end_s = parse_time(args.end)
         name = sanitize_filename(args.name) if args.name else f"{input_mp3.stem}_{int(start_s)}-{int(end_s)}"
         out_path = outdir / f"{name}.mp3"
-        # edge_fade can be applied on single clips too; mono/cbr also respected
+        # stream copy only if no re-encode features requested
         copy = args.copy and args.edge_fade <= 0 and not args.mono and not args.cbr
         run_ffmpeg_cut(
             input_mp3, start_s, end_s, out_path,
@@ -311,7 +383,6 @@ def cmd_run(args):
             edge_fade=max(0.0, args.edge_fade),
             cbr=args.cbr
         )
-        # If mono requested but we stream-copied, we need a second pass — but copy was gated above.
         if args.mono and copy:
             print("note: --mono requires re-encode; ignoring --copy for single clip")
         print(f"wrote {out_path}")
@@ -334,14 +405,11 @@ def cmd_run(args):
         try:
             parts: List[Path] = []
             for i, c in enumerate(clips, 1):
-                # Decide where parts go:
                 if args.concat:
                     part_path = (tmp_dir / f"part_{i:02d}.mp3")
                 else:
-                    # per-clip output names (batch no-concat)
                     part_path = derive_outfile(outdir, c.get("name"), i)
 
-                # For parts, we can stream copy if allowed and no edge_fade requested.
                 part_copy = args.copy and args.edge_fade <= 0 and not args.cbr
                 run_ffmpeg_cut(
                     input_mp3, c["start_s"], c["end_s"], part_path,
@@ -356,7 +424,6 @@ def cmd_run(args):
                     print(f"wrote {part_path}")
 
             if not args.concat:
-                # Done: wrote individual files
                 return
 
             # CONCAT PATH
@@ -368,7 +435,6 @@ def cmd_run(args):
                 print("note: both --xfade and --gap provided; using --xfade and ignoring --gap")
 
             if args.xfade > 0 and len(parts) >= 2:
-                # Crossfade chain (always re-encodes final)
                 ffmpeg_concat_xfade(
                     parts=parts,
                     out_path=merged_out,
@@ -385,7 +451,6 @@ def cmd_run(args):
             else:
                 # Plain concat via demuxer; optionally insert gaps (silence files)
                 if args.gap > 0 and len(parts) >= 2:
-                    # interleave silence files
                     interleaved: List[Path] = []
                     for idx, p in enumerate(parts):
                         interleaved.append(p)
@@ -395,16 +460,13 @@ def cmd_run(args):
                             interleaved.append(sfile)
                     parts = interleaved
 
-                # Build concat list file
                 list_file = tmp_dir / "concat.txt"
                 with list_file.open("w", encoding="utf-8") as lf:
                     for p in parts:
                         lf.write(f"file '{p.as_posix()}'\n")
 
-                # Optional post-filter on entire merged (limiter and/or loudnorm)
-                filter_chain = []
-                # Always nice to have gentle limiter
-                filter_chain.append("alimiter=limit=0.90")
+                # Post-filter chain for final (limiter always on; loudnorm optional)
+                filter_chain = ["alimiter=limit=0.90"]
                 if args.loudnorm is not None:
                     filter_chain.append(f"loudnorm=I={args.loudnorm}:TP=-1.5:LRA=11")
                 filter_a = ",".join(filter_chain) if filter_chain else None
@@ -431,7 +493,6 @@ def cmd_run(args):
                 print(f"kept parts in {clips_dir}")
 
         finally:
-            # cleanup temp dir if not keeping clips
             if tmp_dir and (not args.keep_clips):
                 for p in tmp_dir.glob("*"):
                     try: p.unlink()
@@ -443,71 +504,120 @@ def cmd_run(args):
     print("error: provide --start and --end for a single clip, or -f/--file for batch/concat.", file=sys.stderr)
     sys.exit(2)
 
-# ---------------- CLI ----------------
+# ---------- CLI ----------
 
-def make_parser():
+def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=APP_NAME,
-        description="Cut podcast clips from MP3s; batch, concat, crossfade, gaps, loudness."
+        description=APP_DESC,
+        formatter_class=_SmartFormatter,
+        epilog=_dedent("""\
+            Tips:
+              • Times accept M:SS, H:MM:SS, or raw seconds.
+              • Use --copy for speed when you don't need fades/filters/mono/CBR.
+              • CSV '#default, text...' sets a default description for empty/#default rows.
+              • With --concat, prefer --xfade for smooth transitions or --gap for separation.
+            """),
+        add_help=False  # we'll add -h/--help manually to include in all subparsers too
     )
-    sub = p.add_subparsers(dest="cmd")
 
-    # run
-    pr = sub.add_parser("run", help="Run podmix")
-    pr.add_argument("-i","--input", help="Input MP3 file")
-    pr.add_argument("--start", help="Start time (M:SS, H:MM:SS, or seconds)")
-    pr.add_argument("--end", help="End time (M:SS, H:MM:SS, or seconds)")
-    pr.add_argument("-o","--output", help="Output directory")
-    pr.add_argument("--name", help="Output filename (single clip) or merged name with --concat")
-    pr.add_argument("--info", help="Optional description/notes for metadata")
-    pr.add_argument("-f","--file", help="Batch file (CSV) with rows: start,end,name,description")
+    # Global flags
+    p.add_argument("-h","--help", action="help", help="Show this help message and exit")
+    p.add_argument("--version", action="version", version=f"%(prog)s {APP_VER}", help="Show version and exit")
+    p.add_argument("--examples", action="store_true", help="Print practical usage recipes and exit")
+
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND", title="Commands")
+
+    # ---- run ----
+    pr = sub.add_parser(
+        "run", help="Run podmix (default)", formatter_class=_SmartFormatter, add_help=False,
+        description=_dedent("""\
+            Run podmix to cut clips from an MP3.
+            Modes:
+              • Single clip:  --start + --end (outputs one file)
+              • Batch:        -f/--file CSV (outputs many files)
+              • Concat:       --concat on a batch (one highlight reel)
+            """)
+    )
+    pr.add_argument("-h","--help", action="help", help="Show help for 'run' and exit")
+    pr.add_argument("--examples", action="store_true", help="Show 'run' examples and exit")
+
+    # IO
+    pr.add_argument("-i","--input", metavar="FILE", help="Input MP3 file")
+    pr.add_argument("-o","--output", metavar="DIR", help="Output directory (see 'set' for default)")
+    pr.add_argument("--name", metavar="NAME", help="Output file name (single clip) or merged name with --concat")
+    pr.add_argument("--info", metavar="TEXT", help="Optional description/notes for metadata")
+    pr.add_argument("-f","--file", metavar="CSV",
+                    help=_dedent("""\
+                        Batch CSV with rows: start,end,name,description
+                        Header is optional (auto-detected). Lines starting with '#default' set
+                        a default description for rows that use '#default' or empty description.
+                    """))
+
+    # Single-clip selection
+    pr.add_argument("--start", metavar="TIME", help="Start time (M:SS, H:MM:SS, or seconds)")
+    pr.add_argument("--end",   metavar="TIME", help="End time (M:SS, H:MM:SS, or seconds)")
+
+    # Performance/accuracy
     pr.add_argument("--copy", action="store_true",
-                    help="Try stream copy (fast, less accurate; disabled if filters/mono/cbr needed)")
+                    help="Try stream copy (fast, less accurate; disabled if filters/mono/CBR are used)")
+
+    # Concat controls
     pr.add_argument("--concat", action="store_true", help="Concatenate all batch clips into one MP3")
-    pr.add_argument("--keep-clips", action="store_true", help="With --concat, keep the intermediate per-range clips")
-    # audio shaping
-    pr.add_argument("--xfade", type=float, default=1.0, help="Crossfade seconds between clips (with --concat)")
+    pr.add_argument("--keep-clips", action="store_true", help="With --concat, keep the intermediate cut parts")
+
+    # Audio shaping
+    pr.add_argument("--xfade", type=float, default=1.0,
+                    help="Crossfade seconds between clips (with --concat). Set 0 to disable.")
     pr.add_argument("--xfade-shape", choices=["tri","log","exp","qsin"], default="tri",
                     help="Crossfade curve shape")
-    pr.add_argument("--gap", type=float, default=0.0, help="Silence (seconds) inserted between clips (ignored if --xfade>0)")
-    pr.add_argument("--edge-fade", type=float, default=0.02, help="Fade-in/out (seconds) applied to each cut part")
+    pr.add_argument("--gap", type=float, default=0.0,
+                    help="Silence (seconds) inserted between clips when not using --xfade")
+    pr.add_argument("--edge-fade", type=float, default=0.02,
+                    help="Tiny fade at start/end of each cut part to prevent clicks")
     pr.add_argument("--loudnorm", type=float, default=None,
                     help="Target LUFS for final loudness (e.g., -16 for podcasts). Re-encodes final.")
-    pr.add_argument("--mono", action="store_true", help="Downmix final output to mono")
-    pr.add_argument("--cbr", type=str, default=None, help="Force CBR bitrate for encoded outputs (e.g., 192k)")
+    pr.add_argument("--mono", action="store_true", help="Downmix the final output to mono")
+    pr.add_argument("--cbr", type=str, default=None, metavar="RATE",
+                    help="Force constant bitrate for encoding (e.g., 192k). Default is VBR -q:a 2.")
+
     pr.set_defaults(func=cmd_run)
 
-    # convenience: root behaves like run
-    p.add_argument("-i","--input", help=argparse.SUPPRESS)
-    p.add_argument("--start", help=argparse.SUPPRESS)
-    p.add_argument("--end", help=argparse.SUPPRESS)
-    p.add_argument("-o","--output", help=argparse.SUPPRESS)
-    p.add_argument("--name", help=argparse.SUPPRESS)
-    p.add_argument("--info", help=argparse.SUPPRESS)
-    p.add_argument("-f","--file", help=argparse.SUPPRESS)
-    p.add_argument("--copy", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--concat", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--keep-clips", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--xfade", type=float, default=1.0, help=argparse.SUPPRESS)
-    p.add_argument("--xfade-shape", choices=["tri","log","exp","qsin"], default="tri", help=argparse.SUPPRESS)
-    p.add_argument("--gap", type=float, default=0.0, help=argparse.SUPPRESS)
-    p.add_argument("--edge-fade", type=float, default=0.02, help=argparse.SUPPRESS)
-    p.add_argument("--loudnorm", type=float, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--mono", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--cbr", type=str, default=None, help=argparse.SUPPRESS)
-
-    # set
-    ps = sub.add_parser("set", help="Set defaults")
-    ps.add_argument("--output-default", help="Default output directory")
+    # ---- set ----
+    ps = sub.add_parser(
+        "set", help="Set defaults", formatter_class=_SmartFormatter, add_help=False,
+        description="Configure persistent defaults (stored under ~/.config/podmix/config.json)."
+    )
+    ps.add_argument("-h","--help", action="help", help="Show help for 'set' and exit")
+    ps.add_argument("--output-default", metavar="DIR", help="Default output directory for all runs")
     ps.set_defaults(func=cmd_set)
+
+    # ---- help (topic-aware) ----
+    ph = sub.add_parser(
+        "help", help="Show top-level help or topic help (run | set)",
+        formatter_class=_SmartFormatter, add_help=False
+    )
+    ph.add_argument("-h","--help", action="help", help="Show help for 'help' and exit")
+    ph.add_argument("topic", nargs="?", help="Help topic: run | set")
+    ph.set_defaults(func=lambda a: print_topic_help_and_exit(p, a.topic))
+
     return p
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     parser = make_parser()
-    if argv and argv[0] not in {"run","set"}:
+
+    # Global --examples works from anywhere (before we potentially dispatch to subcommands)
+    if "--examples" in argv and (len(argv) == 1 or argv[0] != "help"):
+        print_examples_and_exit()
+
+    # Convenience: if first token isn't a subcommand, treat as 'run'
+    if argv and argv[0] not in {"run","set","help"}:
         argv = ["run"] + argv
+
     args = parser.parse_args(argv)
+
+    # 'help' subcommand already exits; others continue
     if not hasattr(args, "func"):
         parser.print_help()
         return 2
