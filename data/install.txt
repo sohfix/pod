@@ -1,0 +1,35 @@
+## How to install:
+
+# Step 1: 
+## Clone the repo
+_>git clone https://github.com/sohfix/pod
+_>cd pod
+
+# Step 2:
+## Setup the virtual environment for Python.
+    *note: using 3.11-3.13 currently stable.
+Recommended:
+_>mkdir -p ~/$HOME/apps/.app-data/.venvs
+_>python3 -m venv ~/$HOME/apps/.app-data/.venvs/.media
+_>source ~/$HOME/apps/.app-data/.venvs/.media/bin/activate
+(.media)_> <your shell should look like this>
+
+# Step 3:
+## Install requiremnts.txt
+    *inside the 'pod' directory
+_>pip install -r data/requirements.txt
+
+
+### Run from PATH
+_>:sudo nano ~/.bashrc
+
+add: '$HOME/apps/pod' to  Python $PATH variable.
+
+ctrl-s > ENTER
+ctrl-x
+
+## Reload shell
+_>source ~/.bashrc
+
+## If required, reload env:
+_>source ~/$HOME/apps/.app-data/.venvs/.media/bin/activate
