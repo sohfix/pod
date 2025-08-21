@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+import argparse, csv, json, os, re, subprocess, sys, tempfile
+from pathlib import Path
+from typing import Optional, Tuple, List
+
+APP_NAME = "podmix"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_NAME
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+TIME_PATTERNS = [
+    re.compile(r"^(?P<m>\d+):(?P<s>[0-5]?\d)$"),                 # M:SS
+    re.compile(r"^(?P<h>\d+):(?P<m>[0-5]?\d):(?P<s>[0-5]?\d)$"), # H:MM:SS
+    re.compile(r"^(?P<s>\d+)$"),                                 # seconds
+]
+
+def parse_time(ts: str) -> float:
+    s = ts.strip()
+    for pat in TIME_PATTERNS:
+        m = pat.match(s)
+        if m:
+            h = int(m.groupdict().get("h") or 0)
+            m_ = int(m.groupdict().get("m") or 0)
+            s_ = int(m.groupdict().get("s") or 0)
+            return h * 3600 + m_ * 60 + s_
+    raise ValueError(f"Invalid time format: {ts!r}")
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try: return json.loads(CONFIG_PATH.read_text())
+        except Exception: pass
+    return {}
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+def ensure_outdir(path: Optional[str], cfg: dict) -> Path:
+    outdir = Path(path) if path else Path(cfg.get("output_default", "."))
+    outdir.mkdir(parents=True, exist_ok=True); return outdir
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
+
+def run_ffmpeg_cut(input_mp3: Path, start_s: float, end_s: float, out_path: Path,
+                   title: Optional[str] = None, comment: Optional[str] = None,
+                   copy: bool = False) -> None:
+    if end_s <= start_s: raise ValueError("end must be greater than start")
+    duration = end_s - start_s
+    codec_args = ["-c", "copy"] if copy else ["-acodec", "libmp3lame", " -q:a", "2"]
+    # Note: using VBR (-q:a 2) for good quality; swap to -b:a 192k if you prefer CBR
+    meta = []
+    if title:   meta += ["-metadata", f"title={title}"]
+    if comment: meta += ["-metadata", f"comment={comment}"]
+    cmd = [
+        "ffmpeg","-hide_banner","-loglevel","error",
+        "-ss", f"{start_s:.3f}","-t", f"{duration:.3f}",
+        "-i", str(input_mp3),
+        *codec_args, *meta, str(out_path)
+    ]
+    if subprocess.run(cmd).returncode != 0:
+        raise RuntimeError(f"ffmpeg failed for {out_path.name}")
+
+def sniff_has_header(row: List[str]) -> bool:
+    joined = ",".join(c.strip().lower() for c in row)
+    return "start" in joined and "end" in joined
+
+def parse_batch_file(path: Path) -> Tuple[str, List[dict]]:
+    """
+    CSV format:
+      #default, Your default description (optional; first such line wins)
+      start,end,name,description
+      3:55,4:55,hot_take,#default
+      2:35,3:33,funny_bit,Hosts crack up
+      420,505,,
+    """
+    default_desc = ""; clips = []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f); first_row = None
+        for raw in reader:
+            if not raw or (len(raw) == 1 and not raw[0].strip()): continue
+            if raw[0].strip().startswith("#default"):
+                if len(raw) >= 2: default_desc = ",".join(raw[1:]).strip()
+                continue
+            if raw[0].strip().startswith("#"): continue
+            if first_row is None:
+                first_row = raw
+                if sniff_has_header(first_row): first_row = None; continue
+            row = raw if first_row is None else first_row; first_row = None
+            row = (row + ["", "", "", ""])[:4]
+            start, end, name, desc = [c.strip() for c in row]
+            if not start or not end: raise ValueError(f"Batch row missing start/end: {row}")
+            start_s = parse_time(start); end_s = parse_time(end)
+            nm = sanitize_filename(name) if name else ""
+            description = default_desc if (desc == "#default" or desc == "") else desc
+            clips.append({"start_s": start_s, "end_s": end_s, "name": nm, "description": description})
+    return default_desc, clips
+
+def derive_outfile(base_dir: Path, base_name: Optional[str], idx: int) -> Path:
+    stem = sanitize_filename(base_name) if base_name else f"clip_{idx:02d}"
+    return base_dir / f"{stem}.mp3"
+
+def ffmpeg_concat_list(list_file: Path, out_path: Path, copy: bool,
+                       title: Optional[str], comment: Optional[str]) -> None:
+    codec_args = ["-c","copy"] if copy else ["-acodec","libmp3lame","-q:a","2"]
+    meta = []
+    if title:   meta += ["-metadata", f"title={title}"]
+    if comment: meta += ["-metadata", f"comment={comment}"]
+    cmd = ["ffmpeg","-hide_banner","-loglevel","error","-f","concat","-safe","0",
+           "-i",str(list_file),*codec_args,*meta,str(out_path)]
+    if subprocess.run(cmd).returncode != 0:
+        raise RuntimeError(f"ffmpeg concat failed for {out_path.name}")
+
+def ffmpeg_concat_xfade(parts: List[Path], out_path: Path, xfade: float,
+                        title: Optional[str], comment: Optional[str]) -> None:
+    """
+    Build an acrossfade chain over N inputs:
+      [0:a][1:a]acrossfade=d=XF:... [af1];
+      [af1][2:a]acrossfade=d=XF:... [af2];
+      ...
+      map last [afX]
+    """
+    if len(parts) == 1:
+        cmd = ["ffmpeg","-hide_banner","-loglevel","error","-i",str(parts[0]),
+               "-acodec","libmp3lame","-q:a","2"]
+        if title:   cmd += ["-metadata", f"title={title}"]
+        if comment: cmd += ["-metadata", f"comment={comment}"]
+        cmd += [str(out_path)]
+        if subprocess.run(cmd).returncode != 0:
+            raise RuntimeError(f"ffmpeg failed for {out_path.name}")
+        return
+
+    cmd = ["ffmpeg","-hide_banner","-loglevel","error"]
+    for p in parts: cmd += ["-i", str(p)]
+
+    filters = []
+    prev = "0:a"
+    for i in range(1, len(parts)):
+        cur = f"{i}:a"
+        out = f"af{i}"
+        # triangular shape is a nice neutral default
+        filters.append(f"[{prev}][{cur}]acrossfade=d={xfade}:c1=tri:c2=tri[{out}]")
+        prev = out
+    filter_complex = ";".join(filters)
+
+    out_args = ["-map", f"[{prev}]", "-acodec","libmp3lame","-q:a","2"]
+    if title:   out_args += ["-metadata", f"title={title}"]
+    if comment: out_args += ["-metadata", f"comment={comment}"]
+
+    cmd += ["-filter_complex", filter_complex, *out_args, str(out_path)]
+    if subprocess.run(cmd).returncode != 0:
+        raise RuntimeError(f"ffmpeg xfade failed for {out_path.name}")
+
+def cmd_set(args):
+    cfg = load_config()
+    if args.output_default:
+        cfg["output_default"] = str(Path(args.output_default).expanduser())
+        save_config(cfg)
+        print(f"Set output default to: {cfg['output_default']}")
+
+def cmd_run(args):
+    cfg = load_config()
+    if not args.input:
+        print("error: -i/--input is required", file=sys.stderr); sys.exit(2)
+    input_mp3 = Path(args.input).expanduser()
+    if not input_mp3.exists():
+        print(f"error: input file not found: {input_mp3}", file=sys.stderr); sys.exit(2)
+    outdir = ensure_outdir(args.output, cfg)
+
+    # SINGLE CLIP (no concat)
+    if args.start and args.end and not args.concat:
+        start_s = parse_time(args.start); end_s = parse_time(args.end)
+        name = sanitize_filename(args.name) if args.name else f"{input_mp3.stem}_{int(start_s)}-{int(end_s)}"
+        out_path = outdir / f"{name}.mp3"
+        run_ffmpeg_cut(input_mp3, start_s, end_s, out_path, title=args.name or name, comment=args.info, copy=args.copy)
+        print(f"wrote {out_path}"); return
+
+    # BATCH
+    if args.file:
+        batch_path = Path(args.file).expanduser()
+        if not batch_path.exists():
+            print(f"error: batch file not found: {batch_path}", file=sys.stderr); sys.exit(2)
+        default_desc, clips = parse_batch_file(batch_path)
+        if not clips:
+            print("no clips found in batch file", file=sys.stderr); sys.exit(2)
+
+        if args.concat:
+            merged_name = sanitize_filename(args.name) if args.name else f"{input_mp3.stem}_highlights"
+            merged_out = outdir / f"{merged_name}.mp3"
+            tmp_dir = Path(tempfile.mkdtemp(prefix="podmix_", dir=str(outdir)))
+            parts = []
+            try:
+                # always cut parts; for xfade we re-encode final output
+                for i, c in enumerate(clips, 1):
+                    part_path = tmp_dir / f"part_{i:02d}.mp3"
+                    run_ffmpeg_cut(input_mp3, c["start_s"], c["end_s"], part_path,
+                                   title=f"{merged_name}_part_{i:02d}",
+                                   comment=c.get("description") or args.info or default_desc,
+                                   copy=args.copy if not args.xfade else False)
+                    parts.append(part_path)
+
+                if args.xfade and len(parts) >= 2:
+                    ffmpeg_concat_xfade(
+                        parts=parts,
+                        out_path=merged_out,
+                        xfade=args.xfade,
+                        title=merged_name,
+                        comment=args.info or default_desc
+                    )
+                else:
+                    # plain concat (can stream copy if requested)
+                    list_file = tmp_dir / "concat.txt"
+                    with list_file.open("w", encoding="utf-8") as lf:
+                        for p in parts: lf.write(f"file '{p.as_posix()}'\n")
+                    ffmpeg_concat_list(
+                        list_file=list_file, out_path=merged_out, copy=args.copy,
+                        title=merged_name, comment=args.info or default_desc
+                    )
+
+                print(f"wrote {merged_out}")
+
+                if args.keep_clips:
+                    clips_dir = outdir / f"{merged_name}_parts"
+                    clips_dir.mkdir(exist_ok=True)
+                    for p in parts: p.replace(clips_dir / p.name)
+                    print(f"kept parts in {clips_dir}")
+            finally:
+                if not args.keep_clips:
+                    for p in tmp_dir.glob("*"):
+                        try: p.unlink()
+                        except: pass
+                    try: tmp_dir.rmdir()
+                    except: pass
+            return
+
+        # normal batch (no concat)
+        for i, c in enumerate(clips, 1):
+            out_path = derive_outfile(outdir, c.get("name"), i)
+            run_ffmpeg_cut(input_mp3, c["start_s"], c["end_s"], out_path,
+                           title=out_path.stem,
+                           comment=c.get("description") or args.info or default_desc,
+                           copy=args.copy)
+            print(f"wrote {out_path}")
+        return
+
+    print("error: provide --start and --end for a single clip, or -f/--file for batch mode.", file=sys.stderr)
+    sys.exit(2)
+
+def make_parser():
+    p = argparse.ArgumentParser(prog=APP_NAME, description="Cut podcast clips from MP3s; batch, concat, crossfade.")
+    sub = p.add_subparsers(dest="cmd")
+
+    pr = sub.add_parser("run", help="Run podmix")
+    pr.add_argument("-i","--input", help="Input MP3 file")
+    pr.add_argument("--start", help="Start time (M:SS, H:MM:SS, or seconds)")
+    pr.add_argument("--end", help="End time (M:SS, H:MM:SS, or seconds)")
+    pr.add_argument("-o","--output", help="Output directory")
+    pr.add_argument("--name", help="Output filename (single clip) or merged name with --concat")
+    pr.add_argument("--info", help="Optional description/notes for metadata")
+    pr.add_argument("-f","--file", help="Batch file (CSV) with rows: start,end,name,description")
+    pr.add_argument("--copy", action="store_true", help="Try stream copy (faster, less accurate; ignored for --xfade)")
+    pr.add_argument("--concat", action="store_true", help="Concatenate all batch clips into one MP3")
+    pr.add_argument("--keep-clips", action="store_true", help="With --concat, keep the intermediate per-range clips")
+    pxf = pr.add_argument_group("crossfade")
+    pxf.add_argument("--xfade", type=float, default=0.0, help="Crossfade seconds between clips (with --concat)")
+
+    pr.set_defaults(func=cmd_run)
+
+    # convenience: root behaves like run
+    p.add_argument("-i","--input", help=argparse.SUPPRESS)
+    p.add_argument("--start", help=argparse.SUPPRESS)
+    p.add_argument("--end", help=argparse.SUPPRESS)
+    p.add_argument("-o","--output", help=argparse.SUPPRESS)
+    p.add_argument("--name", help=argparse.SUPPRESS)
+    p.add_argument("--info", help=argparse.SUPPRESS)
+    p.add_argument("-f","--file", help=argparse.SUPPRESS)
+    p.add_argument("--copy", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--concat", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--keep-clips", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--xfade", type=float, default=0.0, help=argparse.SUPPRESS)
+
+    ps = sub.add_parser("set", help="Set defaults")
+    ps.add_argument("--output-default", help="Default output directory")
+    ps.set_defaults(func=cmd_set)
+    return p
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = make_parser()
+    if argv and argv[0] not in {"run","set"}: argv = ["run"] + argv
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"): parser.print_help(); return 2
+    try: return args.func(args) or 0
+    except (ValueError, RuntimeError) as e:
+        print(f"error: {e}", file=sys.stderr); return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
