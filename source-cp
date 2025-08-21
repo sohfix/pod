@@ -4,8 +4,8 @@ import os
 import shutil
 from pathlib import Path
 
-DEFAULT_SRC = "~/apps/podx-app/src"  # change this to your default source path
-DEST_PATH = "~/apps/podx-app/src-backup"
+DEFAULT_SRC = "~/apps/pod"  # change this to your default source path
+DEST_PATH = "~/Downloads/pod-backup"
 
 def copy_source(src_dir, dest_dir):
     src_path = Path(src_dir).expanduser().resolve()
