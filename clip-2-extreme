@@ -19,12 +19,12 @@ import argparse, csv, json, os, re, subprocess, sys, tempfile, textwrap
 from pathlib import Path
 from typing import Optional, Tuple, List
 
-APP_NAME   = "podmix"
+APP_NAME   = "clip2extreme"
 APP_DESC   = "Cut podcast clips from MP3s; batch, concat, crossfade, gaps, loudness."
 APP_VER    = "1.5.0"
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "apps/.app-data/.config-files/.pox_config")) / APP_NAME
-CONFIG_PATH= CONFIG_DIR / "pox_config.json"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "apps/.app-data/.config-files")) / APP_NAME
+CONFIG_PATH= CONFIG_DIR / "config.json"
 
 # ---------- Help & UX ----------
 

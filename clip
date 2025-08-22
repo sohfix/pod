@@ -3,8 +3,8 @@ import argparse, csv, json, os, re, subprocess, sys, tempfile
 from pathlib import Path
 from typing import Optional, Tuple, List
 
-APP_NAME = "podmix"
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_NAME
+APP_NAME = "clip"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "~/apps/.app-data/.config-files")) / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 TIME_PATTERNS = [
