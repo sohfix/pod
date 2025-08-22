@@ -46,3 +46,4 @@ _>mkdir -p ~/apps/.app-data/.config-files/clip2-extreme-tui
 
 ## Activate Environment
 _>source ~/apps/.app-data/.venvs/.media/bin/activate
+_>pip install -r ~/apps/pod/data/requirements.txt
