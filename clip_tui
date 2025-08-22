@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+# Requires: textual>=0.50
+from textual.app import App, ComposeResult
+from textual.widgets import Header, Footer, Input, Button, Static, Checkbox, Select, Label
+from textual.containers import Horizontal, Vertical, Container
+from pathlib import Path
+import asyncio, subprocess, os, shlex
+
+DEFAULT_DIR = Path.home() / "media/audio"  # change if you like
+
+def sh(cmd):
+    return " ".join(shlex.quote(x) for x in cmd)
+
+class ClipTUI(App):
+    CSS = """
+    Screen { align: center middle; }
+    #box { width: 80%; max-width: 120; border: round; padding: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Container(id="box"):
+            yield Label("📻 clip — quick cutter", id="title")
+            # File picker = simple select from directory listing for now
+            files = [f for f in (DEFAULT_DIR.rglob("*.mp3"))]
+            opts = [(f.relative_to(DEFAULT_DIR).as_posix(), str(f)) for f in files][:300]
+            self.sel = Select(options=opts, prompt="Choose input MP3")
+            yield self.sel
+            with Horizontal():
+                self.in_start = Input(placeholder="start (e.g. 1.1 or 0:01.200)")
+                self.in_end   = Input(placeholder="end (e.g. 1.9 or 0:01.950)")
+                yield self.in_start
+                yield self.in_end
+            self.in_name = Input(placeholder="name (filename stem)")
+            yield self.in_name
+            with Horizontal():
+                self.fade_in = Input(placeholder="fade-in (sec, optional)")
+                self.fade_out= Input(placeholder="fade-out (sec, optional)")
+                yield self.fade_in
+                yield self.fade_out
+            with Horizontal():
+                self.cb_copy = Checkbox("Stream copy", value=False)
+                self.cb_wave = Checkbox("Waveform PNG", value=False)
+                self.cb_spec = Checkbox("Spectrogram PNG", value=False)
+                yield self.cb_copy
+                yield self.cb_wave
+                yield self.cb_spec
+            with Horizontal():
+                yield Button("Cut", id="cut", variant="success")
+                yield Button("Quit", id="quit", variant="error")
+            self.status = Static("")
+            yield self.status
+        yield Footer()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "quit":
+            await self.action_quit()
+            return
+        if event.button.id == "cut":
+            await self.do_cut()
+
+    async def do_cut(self):
+        sel = self.sel.value
+        if not sel:
+            self.status.update("Pick a file.")
+            return
+        start = self.in_start.value.strip()
+        end   = self.in_end.value.strip()
+        name  = self.in_name.value.strip() or "clip"
+        fade_i = self.fade_in.value.strip()
+        fade_o = self.fade_out.value.strip()
+
+        cmd = ["clip", "run", "-i", sel, "--start", start, "--end", end, "--name", name]
+        if self.cb_copy.value:
+            cmd.append("--copy")
+        if fade_i:
+            cmd += ["--fade-in", fade_i]
+        if fade_o:
+            cmd += ["--fade-out", fade_o]
+        if self.cb_wave.value:
+            cmd.append("--waveform")
+        if self.cb_spec.value:
+            cmd.append("--spectrogram")
+
+        self.status.update(f"Running:\n{sh(cmd)}")
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await proc.communicate()
+        self.status.update(out.decode("utf-8", errors="ignore") or f"exit={proc.returncode}")
+
+if __name__ == "__main__":
+    ClipTUI().run()
+

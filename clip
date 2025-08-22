@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-clip — cut podcast/audio clips; supports batch, concat, and crossfade.
+clip — cut podcast/audio clips; batch, concat, crossfade, fades, and waveforms.
+
+Features:
+- Times with millisecond precision (e.g., 1.1, 0:01.200, 1:02:03.456).
+- Single cut, batch CSV, concat, and crossfade.
+- Optional per-clip fade-in/out (single or batch).
+- Optional waveform/spectrogram PNG outputs (single or merged).
+- Robust ffmpeg binary resolution (env/config/PATH) with clear errors.
 
 Notes:
 - Requires the ffmpeg executable. Install via your OS package manager (apt/pacman/dnf/zypper/brew/choco).
 - 'pip install ffmpeg' does NOT install the ffmpeg binary.
-- You can set a custom binary with:
+- Set a custom binary with:
     clip set --ffmpeg-bin /path/to/ffmpeg
-  or via environment variable:
+  or:
     FFMPEG_BIN=/path/to/ffmpeg clip run ...
 """
 import argparse, csv, json, os, re, subprocess, sys, tempfile, shutil
@@ -15,15 +22,16 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 
 APP_NAME = "clip"
+BATCH_DIR = Path.home() / "media/audio/batch-files"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "apps/.app-data/.config-files")) / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
+# Support mm:ss(.ms), hh:mm:ss(.ms), or raw seconds(.ms)
 TIME_PATTERNS = [
     re.compile(r"^(?P<m>\d+):(?P<s>[0-5]?\d(?:\.\d+)?)$"),                 # M:SS(.ms)
     re.compile(r"^(?P<h>\d+):(?P<m>[0-5]?\d):(?P<s>[0-5]?\d(?:\.\d+)?)$"), # H:MM:SS(.ms)
     re.compile(r"^(?P<s>\d+(?:\.\d+)?)$"),                                 # seconds(.ms)
 ]
-
 
 def parse_time(ts: str) -> float:
     s = ts.strip()
@@ -35,7 +43,6 @@ def parse_time(ts: str) -> float:
             s_ = float(m.groupdict().get("s") or 0)
             return h * 3600 + m_ * 60 + s_
     raise ValueError(f"Invalid time format: {ts!r}")
-
 
 def load_config() -> dict:
     if CONFIG_PATH.exists():
@@ -80,41 +87,61 @@ def sanitize_filename(name: str) -> str:
 
 def run_ffmpeg_cut(ffbin: str, input_mp3: Path, start_s: float, end_s: float, out_path: Path,
                    title: Optional[str] = None, comment: Optional[str] = None,
-                   copy: bool = False) -> None:
+                   copy: bool = False, fade_in: float = 0.0, fade_out: float = 0.0) -> None:
     if end_s <= start_s:
         raise ValueError("end must be greater than start")
-    duration = end_s - start_s
-    codec_args = ["-c", "copy"] if copy else ["-acodec", "libmp3lame", "-q:a", "2"]
-    # Note: using VBR (-q:a 2) for good quality; swap to -b:a 192k if you prefer CBR
+    dur = end_s - start_s
     meta = []
     if title:
         meta += ["-metadata", f"title={title}"]
     if comment:
         meta += ["-metadata", f"comment={comment}"]
-    cmd = [
-        ffbin, "-hide_banner", "-loglevel", "error", "-y",
-        "-ss", f"{start_s:.3f}", "-t", f"{duration:.3f}",
-        "-i", str(input_mp3),
-        *codec_args, *meta, str(out_path)
-    ]
+
+    # If fades requested, we must re-encode and apply 'afade'
+    if fade_in > 0 or fade_out > 0 or not copy:
+        afilters = []
+        if fade_in > 0:
+            afilters.append(f"afade=t=in:st=0:d={fade_in}")
+        if fade_out > 0:
+            afilters.append(f"afade=t=out:st={max(0.0, dur - fade_out)}:d={fade_out}")
+        filter_arg = ["-af", ",".join(afilters)] if afilters else []
+        cmd = [
+            ffbin, "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{start_s:.3f}", "-t", f"{dur:.3f}",
+            "-i", str(input_mp3),
+            *filter_arg,
+            "-acodec", "libmp3lame", "-q:a", "2",
+            *meta, str(out_path)
+        ]
+    else:
+        # stream copy (no fades possible)
+        cmd = [
+            ffbin, "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{start_s:.3f}", "-t", f"{dur:.3f}",
+            "-i", str(input_mp3),
+            "-c", "copy",
+            *meta, str(out_path)
+        ]
+
     if subprocess.run(cmd).returncode != 0:
         raise RuntimeError(f"ffmpeg failed for {out_path.name}")
 
 def sniff_has_header(row: List[str]) -> bool:
     joined = ",".join(c.strip().lower() for c in row)
+    # accept any of these 'start'/'end' cues in header
     return "start" in joined and "end" in joined
 
 def parse_batch_file(path: Path) -> Tuple[str, List[dict]]:
     """
     CSV format:
       #default, Your default description (optional; first such line wins)
-      start,end,name,description
-      3:55,4:55,hot_take,#default
-      2:35,3:33,funny_bit,Hosts crack up
-      420,505,,
+      start,end,name,description,fade_in,fade_out
+      3:55,4:55,hot_take,#default,0.10,0.10
+      2:35,3:33,funny_bit,Hosts crack up,0.15,0.20
+      420,505,,,
     """
     default_desc = ""
-    clips = []
+    clips: List[dict] = []
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
         first_row = None
@@ -134,15 +161,22 @@ def parse_batch_file(path: Path) -> Tuple[str, List[dict]]:
                     continue
             row = raw if first_row is None else first_row
             first_row = None
-            row = (row + ["", "", "", ""])[:4]
-            start, end, name, desc = [c.strip() for c in row]
+            # allow up to 6 fields; pad missing
+            row = (row + ["", "", "", "", "", ""])[:6]
+            start, end, name, desc, fade_in_s, fade_out_s = [c.strip() for c in row]
             if not start or not end:
                 raise ValueError(f"Batch row missing start/end: {row}")
             start_s = parse_time(start)
             end_s = parse_time(end)
             nm = sanitize_filename(name) if name else ""
             description = default_desc if (desc == "#default" or desc == "") else desc
-            clips.append({"start_s": start_s, "end_s": end_s, "name": nm, "description": description})
+            fade_in = float(fade_in_s) if fade_in_s else 0.0
+            fade_out = float(fade_out_s) if fade_out_s else 0.0
+            clips.append({
+                "start_s": start_s, "end_s": end_s, "name": nm,
+                "description": description,
+                "fade_in": fade_in, "fade_out": fade_out
+            })
     return default_desc, clips
 
 def derive_outfile(base_dir: Path, base_name: Optional[str], idx: int) -> Path:
@@ -207,6 +241,18 @@ def ffmpeg_concat_xfade(ffbin: str, parts: List[Path], out_path: Path, xfade: fl
     if subprocess.run(cmd).returncode != 0:
         raise RuntimeError(f"ffmpeg xfade failed for {out_path.name}")
 
+def render_wave_image(ffbin: str, audio_path: Path, width: int, height: int, png_out: Path, spectro: bool=False) -> None:
+    if spectro:
+        filt = f"showspectrumpic=s={width}x{height}:legend=disabled"
+    else:
+        filt = f"showwavespic=s={width}x{height}:split_channels=0"
+    cmd = [ffbin, "-hide_banner", "-loglevel", "error", "-y",
+           "-i", str(audio_path),
+           "-filter_complex", filt,
+           "-frames:v", "1", str(png_out)]
+    if subprocess.run(cmd).returncode != 0:
+        raise RuntimeError(f"waveform render failed for {audio_path.name}")
+
 def cmd_set(args):
     cfg = load_config()
     if args.output_default:
@@ -239,13 +285,20 @@ def cmd_run(args):
         end_s = parse_time(args.end)
         name = sanitize_filename(args.name) if args.name else f"{input_mp3.stem}_{int(start_s)}-{int(end_s)}"
         out_path = outdir / f"{name}.mp3"
-        run_ffmpeg_cut(ffbin, input_mp3, start_s, end_s, out_path, title=args.name or name, comment=args.info, copy=args.copy)
+        run_ffmpeg_cut(ffbin, input_mp3, start_s, end_s, out_path,
+                       title=args.name or name, comment=args.info, copy=args.copy,
+                       fade_in=args.fade_in, fade_out=args.fade_out)
         print(f"wrote {out_path}")
+        if args.waveform or args.spectrogram:
+            png = out_path.with_suffix(".png") if args.waveform else out_path.with_suffix(".spec.png")
+            render_wave_image(ffbin, out_path, args.img_width, args.img_height, png, spectro=args.spectrogram)
+            print(f"wrote {png}")
         return
 
     # BATCH
     if args.file:
-        batch_path = Path(args.file).expanduser()
+        batch_path = (BATCH_DIR / args.file).expanduser()
+
         if not batch_path.exists():
             print(f"error: batch file not found: {batch_path}", file=sys.stderr); sys.exit(2)
         default_desc, clips = parse_batch_file(batch_path)
@@ -256,15 +309,19 @@ def cmd_run(args):
             merged_name = sanitize_filename(args.name) if args.name else f"{input_mp3.stem}_highlights"
             merged_out = outdir / f"{merged_name}.mp3"
             tmp_dir = Path(tempfile.mkdtemp(prefix="podmix_", dir=str(outdir)))
-            parts = []
+            parts: List[Path] = []
             try:
                 # always cut parts; for xfade we re-encode final output
                 for i, c in enumerate(clips, 1):
                     part_path = tmp_dir / f"part_{i:02d}.mp3"
-                    run_ffmpeg_cut(ffbin, input_mp3, c["start_s"], c["end_s"], part_path,
-                                   title=f"{merged_name}_part_{i:02d}",
-                                   comment=c.get("description") or args.info or default_desc,
-                                   copy=args.copy if not args.xfade else False)
+                    run_ffmpeg_cut(
+                        ffbin, input_mp3, c["start_s"], c["end_s"], part_path,
+                        title=f"{merged_name}_part_{i:02d}",
+                        comment=c.get("description") or args.info or default_desc,
+                        copy=(args.copy and not args.xfade),
+                        fade_in=c.get("fade_in", args.fade_in),
+                        fade_out=c.get("fade_out", args.fade_out)
+                    )
                     parts.append(part_path)
 
                 if args.xfade and len(parts) >= 2:
@@ -290,6 +347,11 @@ def cmd_run(args):
 
                 print(f"wrote {merged_out}")
 
+                if args.waveform or args.spectrogram:
+                    png = merged_out.with_suffix(".png") if args.waveform else merged_out.with_suffix(".spec.png")
+                    render_wave_image(ffbin, merged_out, args.img_width, args.img_height, png, spectro=args.spectrogram)
+                    print(f"wrote {png}")
+
                 if args.keep_clips:
                     clips_dir = outdir / f"{merged_name}_parts"
                     clips_dir.mkdir(exist_ok=True)
@@ -312,33 +374,53 @@ def cmd_run(args):
         # normal batch (no concat)
         for i, c in enumerate(clips, 1):
             out_path = derive_outfile(outdir, c.get("name"), i)
-            run_ffmpeg_cut(ffbin, input_mp3, c["start_s"], c["end_s"], out_path,
-                           title=out_path.stem,
-                           comment=c.get("description") or args.info or default_desc,
-                           copy=args.copy)
+            run_ffmpeg_cut(
+                ffbin, input_mp3, c["start_s"], c["end_s"], out_path,
+                title=out_path.stem,
+                comment=c.get("description") or args.info or default_desc,
+                copy=args.copy,
+                fade_in=c.get("fade_in", args.fade_in),
+                fade_out=c.get("fade_out", args.fade_out)
+            )
             print(f"wrote {out_path}")
+            if args.waveform_each or args.spectrogram_each:
+                png = out_path.with_suffix(".png") if args.waveform_each else out_path.with_suffix(".spec.png")
+                render_wave_image(ffbin, out_path, args.img_width, args.img_height, png, spectro=args.spectrogram_each)
+                print(f"wrote {png}")
         return
 
     print("error: provide --start and --end for a single clip, or -f/--file for batch mode.", file=sys.stderr)
     sys.exit(2)
 
 def make_parser():
-    p = argparse.ArgumentParser(prog=APP_NAME, description="Cut podcast clips from MP3s; batch, concat, crossfade.")
+    p = argparse.ArgumentParser(prog=APP_NAME, description="Cut podcast clips from MP3s; batch, concat, crossfade, fades, and waveforms.")
     sub = p.add_subparsers(dest="cmd")
 
     pr = sub.add_parser("run", help="Run clip")
     pr.add_argument("-i","--input", help="Input MP3 file")
-    pr.add_argument("--start", help="Start time (M:SS, H:MM:SS, or seconds)")
-    pr.add_argument("--end", help="End time (M:SS, H:MM:SS, or seconds)")
+    pr.add_argument("--start", help="Start time (M:SS, H:MM:SS, or seconds; supports .ms)")
+    pr.add_argument("--end", help="End time (M:SS, H:MM:SS, or seconds; supports .ms)")
     pr.add_argument("-o","--output", help="Output directory")
     pr.add_argument("--name", help="Output filename (single clip) or merged name with --concat")
     pr.add_argument("--info", help="Optional description/notes for metadata")
-    pr.add_argument("-f","--file", help="Batch file (CSV) with rows: start,end,name,description")
-    pr.add_argument("--copy", action="store_true", help="Try stream copy (faster, less accurate; ignored for --xfade)")
+    pr.add_argument("-f","--file", help="Batch file (CSV) with rows: start,end,name,description,fade_in,fade_out")
+    pr.add_argument("--copy", action="store_true", help="Try stream copy (faster, less accurate; ignored for fades or --xfade)")
     pr.add_argument("--concat", action="store_true", help="Concatenate all batch clips into one MP3")
     pr.add_argument("--keep-clips", action="store_true", help="With --concat, keep the intermediate per-range clips")
     pxf = pr.add_argument_group("crossfade")
     pxf.add_argument("--xfade", type=float, default=0.0, help="Crossfade seconds between clips (with --concat)")
+
+    pfade = pr.add_argument_group("fades")
+    pfade.add_argument("--fade-in", type=float, default=0.0, help="Fade-in seconds (single clip or batch default)")
+    pfade.add_argument("--fade-out", type=float, default=0.0, help="Fade-out seconds (single clip or batch default)")
+
+    pimg = pr.add_argument_group("images")
+    pimg.add_argument("--waveform", action="store_true", help="Write a waveform PNG for the result (single or merged)")
+    pimg.add_argument("--spectrogram", action="store_true", help="Write a spectrogram PNG for the result (single or merged)")
+    pimg.add_argument("--waveform-each", action="store_true", help="Write waveform PNG for each batch clip (no concat)")
+    pimg.add_argument("--spectrogram-each", action="store_true", help="Write spectrogram PNG for each batch clip (no concat)")
+    pimg.add_argument("--img-width", type=int, default=1280, help="Waveform/spectrogram width")
+    pimg.add_argument("--img-height", type=int, default=250, help="Waveform/spectrogram height")
 
     pr.set_defaults(func=cmd_run)
 
@@ -354,6 +436,14 @@ def make_parser():
     p.add_argument("--concat", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--keep-clips", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--xfade", type=float, default=0.0, help=argparse.SUPPRESS)
+    p.add_argument("--fade-in", type=float, default=0.0, help=argparse.SUPPRESS)
+    p.add_argument("--fade-out", type=float, default=0.0, help=argparse.SUPPRESS)
+    p.add_argument("--waveform", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--spectrogram", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--waveform-each", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--spectrogram-each", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--img-width", type=int, default=1280, help=argparse.SUPPRESS)
+    p.add_argument("--img-height", type=int, default=250, help=argparse.SUPPRESS)
 
     ps = sub.add_parser("set", help="Set defaults")
     ps.add_argument("--output-default", help="Default output directory")
@@ -376,7 +466,6 @@ def main(argv=None):
         print(f"error: {e}", file=sys.stderr)
         return 1
     except FileNotFoundError as e:
-        # For missing ffmpeg (raised in find_ffmpeg)
         print(f"error: {e}", file=sys.stderr)
         return 127
 

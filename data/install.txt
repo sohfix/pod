@@ -39,6 +39,7 @@ _>source ~/$HOME/apps/.app-data/.venvs/.media/bin/activate
 
 _>mkdir -p ~/media/audio/default/clip-2-extreme
 _>mkdir -p ~/media/audio/default/clip
+_>mkdir -p ~/media/audio/batch-files
 _>mkdir -p ~/media/audio/default/clip2-extreme-tui
 _>mkdir -p ~/apps/.app-data/.config-files/clip-2-extreme
 _>mkdir -p ~/apps/.app-data/.config-files/clip
