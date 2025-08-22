@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pox — CLI Podcast Manager (single-file implementation)
+pox — CLI Podcast Manager (RSS-only, single-file)
+
+🚦 RSS-only: This tool strictly supports RSS feeds (RSS 2.0-style).
+    - Root must be <rss> (optionally namespaced) containing <channel>/<item>.
+    - Atom feeds (<feed>) are rejected with an error.
+    - Each episode must be discoverable under <item>, and audio is taken from:
+        <enclosure url="..."> or <media:content url="..." type="audio/*">
 
 Features:
-- Init config/data dirs and PodFile
+- Init config/data dirs and PodFile (RSS feed URLs)
 - Manage feeds (list/add/remove/rename, set summary)
-- Refresh episodes into a SQLite manifest
+- Refresh episodes (RSS-only) into a SQLite manifest
 - Info per feed (counts, last publish)
 - Search (single feed / all feeds)
 - Download episodes (by latest N, all, ids) and by title
 - Download queue (add/list/download/remove/reset)
-- Playlists of downloaded episodes (create/add/remove/list/show/export m3u)
+- Playlists (create/add/remove/list/show/export m3u)
 - Clean (clear download records per feed, optional file deletion)
 
 Standard library only. No external deps.
@@ -31,7 +37,6 @@ Examples:
     pox queue-list
     pox queue-download
     pox playlist create favorites
-    pox playlist add favorites --episode-id 7
     pox playlist export favorites --out ~/favorites.m3u
 """
 
@@ -40,8 +45,6 @@ import configparser
 import contextlib
 import datetime as dt
 import email.utils
-import functools
-import io
 import os
 import re
 import shutil
@@ -58,7 +61,7 @@ from typing import Dict, List, Optional, Tuple
 # ---------- Paths & Constants ----------
 
 APP_NAME = "pox"
-DESC = "CLI Podcast Manager"
+DESC = "CLI Podcast Manager (RSS-only)"
 
 def xdg_path(env_key: str, default_sub: str) -> str:
     base = os.environ.get(env_key)
@@ -179,7 +182,6 @@ def read_podfile() -> configparser.ConfigParser:
         cfg["summaries"] = {}
         with open(PODFILE_PATH, "w", encoding="utf-8") as f:
             cfg.write(f)
-    # Ensure sections exist
     if "feeds" not in cfg:
         cfg["feeds"] = {}
     if "summaries" not in cfg:
@@ -207,14 +209,9 @@ def human_size(n: Optional[int]) -> str:
         size /= 1024
 
 def parse_date(s: Optional[str]) -> Optional[str]:
-    """
-    Parse common RSS/Atom date formats to ISO 8601 (UTC if possible).
-    Returns the input if parsing fails.
-    """
     if not s:
         return None
     s = s.strip()
-    # Try RFC2822 via email.utils
     try:
         dtm = email.utils.parsedate_to_datetime(s)
         if dtm is not None:
@@ -223,7 +220,6 @@ def parse_date(s: Optional[str]) -> Optional[str]:
             return dtm.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat()
     except Exception:
         pass
-    # Try ISO-ish
     try:
         iso = s.replace("Z", "+00:00")
         dtm = dt.datetime.fromisoformat(iso)
@@ -234,15 +230,11 @@ def parse_date(s: Optional[str]) -> Optional[str]:
         return s  # fallback to original
 
 def http_get(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/xml, text/xml, */*"})
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         return resp.read()
 
 def http_stream_to_file(url: str, out_path: str) -> Tuple[int, Optional[int]]:
-    """
-    Stream download to out_path. Returns (bytes_written, content_length or None).
-    Prints a simple progress indicator to stderr.
-    """
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         total = resp.headers.get("Content-Length")
@@ -257,7 +249,6 @@ def http_stream_to_file(url: str, out_path: str) -> Tuple[int, Optional[int]]:
                     break
                 f.write(chunk)
                 written += len(chunk)
-                # progress
                 if total_i:
                     pct = written * 100 // total_i
                     speed = written / max(1e-6, (time.time() - start))
@@ -266,54 +257,7 @@ def http_stream_to_file(url: str, out_path: str) -> Tuple[int, Optional[int]]:
             eprint("\r  100% " + " " * 40)
         return written, total_i
 
-# ---------- Feed Parsing ----------
-
-def parse_feed(xml_bytes: bytes) -> List[Dict[str, Optional[str]]]:
-    """
-    Returns list of items with keys:
-      guid, title, pub_date, enclosure_url, link, description
-    Supports basic RSS 2.0 and Atom 1.0.
-    """
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError as e:
-        raise SystemExit(f"Failed to parse feed XML: {e}")
-
-    tag = root.tag.lower()
-    items = []
-    if tag.endswith("rss") or "rdf" in tag:
-        # RSS 2.0
-        channel = root.find("channel")
-        if channel is None:
-            # Sometimes namespaces; try wildcard
-            channel = root.find(".//channel")
-        if channel is None:
-            # Fall back: treat root children
-            channel = root
-        for it in channel.findall("item"):
-            items.append(parse_rss_item(it))
-        # Namespaced item tags (itunes) may still appear as 'item' with ns; findall(".//{*}item")
-        if not items:
-            for it in channel.findall(".//item"):
-                items.append(parse_rss_item(it))
-    elif tag.endswith("feed"):
-        # Atom
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        for it in root.findall("atom:entry", ns):
-            items.append(parse_atom_entry(it, ns))
-        if not items:  # fallback without ns
-            for it in root.findall("entry"):
-                items.append(parse_atom_entry(it, {}))
-    else:
-        # Unknown, try both methods
-        for it in root.findall(".//item"):
-            items.append(parse_rss_item(it))
-        if not items:
-            for it in root.findall(".//{http://www.w3.org/2005/Atom}entry"):
-                items.append(parse_atom_entry(it, {"atom": "http://www.w3.org/2005/Atom"}))
-    # Filter empties
-    items = [i for i in items if i.get("title") or i.get("enclosure_url") or i.get("guid")]
-    return items
+# ---------- RSS Parsing (RSS-only) ----------
 
 def text_of(elem: Optional[ET.Element]) -> Optional[str]:
     if elem is None:
@@ -327,11 +271,11 @@ def find_enclosure_rss(item: ET.Element) -> Optional[str]:
         url = enc.get("url")
         if url:
             return url.strip()
-    # Fallback: media:content
+    # Fallback: media:content (namespaced)
     for e in item.findall(".//{*}content"):
         if e.get("url"):
             t = (e.get("type") or "").lower()
-            if not t or t.startswith("audio/") or "mpeg" in t or "mp3" in t or "aac" in t or "ogg" in t:
+            if not t or t.startswith("audio/") or "mpeg" in t or "mp3" in t or "aac" in t or "ogg" in t or "opus" in t or "m4a" in t:
                 return e.get("url").strip()
     return None
 
@@ -340,7 +284,7 @@ def parse_rss_item(it: ET.Element) -> Dict[str, Optional[str]]:
     guid = text_of(it.find("guid")) or text_of(it.find("{*}id"))
     link = text_of(it.find("link"))
     desc = text_of(it.find("description")) or text_of(it.find("{*}summary"))
-    pub = text_of(it.find("pubDate")) or text_of(it.find("{*}date"))
+    pub  = text_of(it.find("pubDate")) or text_of(it.find("{*}date"))
     enclosure = find_enclosure_rss(it)
     return {
         "guid": guid or (enclosure or title),
@@ -351,56 +295,49 @@ def parse_rss_item(it: ET.Element) -> Dict[str, Optional[str]]:
         "description": desc,
     }
 
-def find_enclosure_atom(entry: ET.Element, ns: Dict[str, str]) -> Optional[str]:
-    # <link rel="enclosure" href="..."> OR <link type="audio/*">
-    for lk in entry.findall("atom:link", ns) if ns else entry.findall("link"):
-        rel = (lk.get("rel") or "").lower()
-        typ = (lk.get("type") or "").lower()
-        href = (lk.get("href") or "").strip()
-        if rel == "enclosure" and href:
-            return href
-        if typ.startswith("audio/") and href:
-            return href
-    # media:content fallback
-    for e in entry.findall(".//{*}content"):
-        if e.get("url"):
-            t = (e.get("type") or "").lower()
-            if not t or t.startswith("audio/"):
-                return e.get("url").strip()
-    return None
+def parse_feed_rss(xml_bytes: bytes) -> List[Dict[str, Optional[str]]]:
+    """
+    Strictly parse RSS feeds. Reject Atom (<feed>) and unknown roots.
+    Returns items with keys: guid, title, pub_date, enclosure_url, link, description.
+    """
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse feed XML: {e}")
 
-def parse_atom_entry(it: ET.Element, ns: Dict[str, str]) -> Dict[str, Optional[str]]:
-    title = text_of(it.find("atom:title", ns)) or text_of(it.find("title"))
-    guid  = text_of(it.find("atom:id", ns)) or text_of(it.find("id"))
-    link  = None
-    if ns:
-        lk = it.find("atom:link[@rel='alternate']", ns) or it.find("atom:link", ns)
-        if lk is not None:
-            link = (lk.get("href") or "").strip() or None
-    else:
-        lk = it.find("link")
-        if lk is not None:
-            link = (lk.get("href") or lk.text or "").strip() or None
-    desc = text_of(it.find("atom:summary", ns)) or text_of(it.find("summary")) or text_of(it.find("atom:content", ns)) or text_of(it.find("content"))
-    pub  = text_of(it.find("atom:published", ns)) or text_of(it.find("atom:updated", ns)) or text_of(it.find("published")) or text_of(it.find("updated"))
-    enclosure = find_enclosure_atom(it, ns)
-    return {
-        "guid": guid or (enclosure or title),
-        "title": title,
-        "pub_date": parse_date(pub),
-        "enclosure_url": enclosure,
-        "link": link,
-        "description": desc,
-    }
+    tag = root.tag.lower()
+    # Accept <rss ...> (possibly namespaced) or <rdf:RDF> with channel/item, but REJECT <feed>
+    if tag.endswith("feed"):
+        raise SystemExit("This URL appears to be an Atom feed (<feed>). RSS is required. Please supply an RSS feed URL.")
+    if not tag.endswith("rss") and "rdf" not in tag:
+        raise SystemExit(f"Unsupported feed format (root tag '{root.tag}'). RSS is required.")
+
+    channel = root.find("channel")
+    if channel is None:
+        # Try wildcard search (namespaced)
+        channel = root.find(".//channel")
+    if channel is None:
+        raise SystemExit("Invalid RSS: <channel> not found.")
+
+    items = []
+    for it in channel.findall("item"):
+        items.append(parse_rss_item(it))
+    if not items:
+        for it in channel.findall(".//item"):
+            items.append(parse_rss_item(it))
+
+    # Keep only meaningful items
+    items = [i for i in items if i.get("title") or i.get("enclosure_url") or i.get("guid")]
+    if not items:
+        eprint("Warning: RSS parsed but contained no <item> entries.")
+    return items
 
 # ---------- CLI Actions ----------
 
 def cmd_init(args):
     ensure_dirs()
     cfg = read_podfile()
-    # Write back to ensure file exists
     write_podfile(cfg)
-    # Touch DB
     with connect_db() as conn:
         pass
     print(f"Initialized:\n  Config:    {PODFILE_PATH}\n  Database:  {DB_PATH}\n  Downloads: {DOWNLOADS_DIR}")
@@ -410,9 +347,9 @@ def cmd_list_feeds(args):
     feeds = cfg["feeds"]
     sums = cfg["summaries"]
     if not feeds:
-        print("No feeds configured. Use 'add-feed' to add one.")
+        print("No feeds configured. Use 'add-feed' to add one (RSS only).")
         return
-    print("Configured feeds:")
+    print("Configured RSS feeds:")
     for sn, url in feeds.items():
         summ = (sums.get(sn) or "").strip()
         summ = f" — {summ[:80]}{'…' if len(summ) > 80 else ''}" if summ else ""
@@ -431,7 +368,8 @@ def cmd_add_feed(args):
         conn.execute("INSERT OR REPLACE INTO feeds(short_name, url, custom_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                      (short, url, None, now, now))
         conn.commit()
-    print(f"Added feed '{short}': {url}")
+    print(f"Added RSS feed '{short}': {url}")
+    print("Note: Feeds are validated as RSS during 'refresh'.")
 
 def cmd_remove_feed(args):
     short = args.short_name
@@ -441,7 +379,6 @@ def cmd_remove_feed(args):
     if short not in cfg["feeds"]:
         raise SystemExit(f"Feed '{short}' not found.")
     url = cfg["feeds"].pop(short)
-    # Remove summary if present
     if cfg.has_section("summaries") and cfg["summaries"].get(short):
         cfg["summaries"].pop(short, None)
     write_podfile(cfg)
@@ -470,7 +407,6 @@ def cmd_rename_feed(args):
         raise SystemExit(f"Target short name '{new}' already exists.")
     url = cfg["feeds"].pop(old)
     cfg["feeds"][new] = url
-    # Move summary
     if cfg.has_section("summaries"):
         s = cfg["summaries"].pop(old, None)
         if s is not None:
@@ -483,7 +419,6 @@ def cmd_rename_feed(args):
         conn.execute("UPDATE downloads SET feed = ? WHERE feed = ?", (new, old))
         conn.execute("UPDATE queue SET feed = ? WHERE feed = ?", (new, old))
         conn.commit()
-    # Move files directory
     old_dir = os.path.join(DOWNLOADS_DIR, old)
     new_dir = os.path.join(DOWNLOADS_DIR, new)
     if os.path.isdir(old_dir):
@@ -503,7 +438,6 @@ def cmd_set_summary(args):
 
 def cmd_refresh(args):
     cfg = read_podfile()
-    targets: List[str]
     if args.all:
         targets = list(cfg["feeds"].keys())
         if not targets:
@@ -518,14 +452,18 @@ def cmd_refresh(args):
     with connect_db() as conn:
         for short in targets:
             url = cfg["feeds"][short]
-            print(f"[{short}] Fetching: {url}")
+            print(f"[{short}] Fetching RSS: {url}")
             try:
                 xml = http_get(url)
             except Exception as e:
                 eprint(f"  Error fetching feed: {e}")
                 continue
-            items = parse_feed(xml)
-            print(f"  Parsed {len(items)} items")
+            try:
+                items = parse_feed_rss(xml)  # RSS-only enforcement
+            except SystemExit as se:
+                eprint(f"  Validation failed: {se}")
+                continue
+            print(f"  Parsed {len(items)} RSS item(s)")
             added = 0
             now = now_iso()
             for it in items:
@@ -565,6 +503,7 @@ def cmd_info(args):
         last_pub_s = last_pub["pub_date"] if last_pub else "N/A"
     print(f"Feed:        {short}")
     print(f"URL:         {url}")
+    print(f"Format:      RSS (enforced)")
     print(f"Episodes:    {c1}")
     print(f"Downloaded:  {c2}")
     print(f"Last publish:{' ' if last_pub_s!='N/A' else ''}{last_pub_s}")
@@ -627,12 +566,11 @@ def _download_one(conn: sqlite3.Connection, feed: str, row: sqlite3.Row, out_dir
     title = row["title"]
     enc = row["enclosure_url"]
     if not enc:
-        eprint(f"  [id={eid}] Skipped: no enclosure URL")
+        eprint(f"  [id={eid}] Skipped: no enclosure URL in RSS item")
         return False, None
     fname = _derive_filename(title, enc)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, fname)
-    # Avoid re-downloading if file exists and there's already a completed record
     existing = conn.execute("SELECT 1 FROM downloads WHERE episode_id = ? AND status = 'completed'", (eid,)).fetchone()
     if existing and os.path.exists(out_path):
         print(f"  [id={eid}] Already downloaded: {fname}")
@@ -746,7 +684,6 @@ def cmd_queue_add(args):
                                (feed, f"%{title_q}%")).fetchone()
         if not row:
             raise SystemExit("Episode not found.")
-        # Avoid duplicates
         existing = conn.execute("SELECT 1 FROM queue WHERE episode_id = ?", (row["id"],)).fetchone()
         if existing:
             print(f"Already in queue: id={row['id']}  {row['title']}")
@@ -806,13 +743,11 @@ def cmd_queue_download(args):
                 per_feed_dirs[feed] = out_dir
             success, _ = _download_one(conn, feed, r, out_dir)
             ok += int(success)
-            # Remove from queue regardless (download attempts happen once)
             conn.execute("DELETE FROM queue WHERE id = ?", (r["id"],))
             conn.commit()
         print(f"Downloaded {ok}/{len(rows)} queued episodes.")
 
 def cmd_playlist(args):
-    # This subcommand has its own subparsers; dispatch here
     args.playlist_func(args)
 
 def playlist_create(args):
@@ -843,7 +778,6 @@ def playlist_add(args):
         ep = conn.execute("SELECT id FROM episodes WHERE id = ?", (eid,)).fetchone()
         if not ep:
             raise SystemExit("Episode not found.")
-        # Next position
         pos_row = conn.execute("SELECT COALESCE(MAX(position), 0) AS p FROM playlist_items WHERE playlist_name = ?", (name,)).fetchone()
         pos = int(pos_row["p"]) + 1
         conn.execute("INSERT OR REPLACE INTO playlist_items(playlist_name, episode_id, position, added_at) VALUES (?, ?, ?, ?)",
@@ -909,13 +843,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_init)
 
     # list-feeds
-    p = sub.add_parser("list-feeds", help="List all configured podcast feeds")
+    p = sub.add_parser("list-feeds", help="List all configured podcast feeds (RSS only)")
     p.set_defaults(func=cmd_list_feeds)
 
     # add-feed
-    p = sub.add_parser("add-feed", help="Add a new podcast feed")
+    p = sub.add_parser("add-feed", help="Add a new podcast feed (RSS URL)")
     p.add_argument("short_name", help="Short name to refer to this feed")
-    p.add_argument("url", help="RSS/Atom URL")
+    p.add_argument("url", help="RSS URL (Atom will be rejected on refresh)")
     p.set_defaults(func=cmd_add_feed)
 
     # remove-feed
@@ -932,7 +866,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_rename_feed)
 
     # refresh
-    p = sub.add_parser("refresh", help="Refresh episode list for a podcast")
+    p = sub.add_parser("refresh", help="Refresh episode list for a podcast (RSS validation enforced)")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--feed", help="Short name of the feed to refresh")
     g.add_argument("--all", action="store_true", help="Refresh all feeds")
@@ -1058,4 +992,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
