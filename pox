@@ -20,11 +20,6 @@ Features:
 - Playlists (create/add/remove/list/show/export m3u)
 - Clean (clear download records per feed, optional file deletion)
 
-Standard library only. No external deps.
-
-Save this file as `pox` (or `pox.py`) and make it executable:
-    chmod +x pox
-
 Examples:
     pox init
     pox add-feed myshow https://example.com/podcast.xml
@@ -70,11 +65,15 @@ def xdg_path(env_key: str, default_sub: str) -> str:
     home = os.path.expanduser("~")
     return os.path.join(home, default_sub, APP_NAME)
 
-CONFIG_DIR = xdg_path("XDG_CONFIG_HOME", ".config")
-DATA_DIR   = xdg_path("XDG_DATA_HOME", ".local/share")
-DB_PATH = os.path.join(DATA_DIR, "pox.db")
+# Put all config/state here (PodFile.ini + database)
+CONFIG_DIR = os.path.expanduser("~/apps/.app-data/.config-files/pox")
+DATA_DIR   = CONFIG_DIR 
+DB_PATH = os.path.join(CONFIG_DIR, "pox.db")
 PODFILE_PATH = os.path.join(CONFIG_DIR, "PodFile.ini")
-DOWNLOADS_DIR = os.path.join(DATA_DIR, "downloads")
+
+# Default audio downloads go here
+DOWNLOADS_DIR = os.path.expanduser("~/media/audio/default/pox")
+
 
 USER_AGENT = f"{APP_NAME}/1.0 (+https://example.invalid)"
 HTTP_TIMEOUT = 45
