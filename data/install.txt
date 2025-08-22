@@ -47,3 +47,9 @@ _>mkdir -p ~/apps/.app-data/.config-files/clip2-extreme-tui
 ## Activate Environment
 _>source ~/apps/.app-data/.venvs/.media/bin/activate
 _>pip install -r ~/apps/pod/data/requirements.txt
+
+## Make Excecutable
+_>chmod +x pox clip clip2-extreme-tui clip-2-extreme
+
+## PATH var
+_>export PATH="$HOME/.local/bin:/usr/local/bin:$HOME/apps/pod::$PATH"
