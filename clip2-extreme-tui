@@ -25,13 +25,13 @@ from textual.widgets import (
 )
 from textual.reactive import reactive
 
-APP_NAME = "clip2extreme"
-CONFIG_DIR = Path.home() / "apps/.app-data/.config-files/.clip_config" / "clip2extreme"
+APP_NAME = "clip2-extreme-tui"
+CONFIG_DIR = Path.home() / "apps/.app-data/.config-files" / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 DEFAULT_CONFIG = {
     "recent_files": [],
-    "output_dir": str((Path.home() / "ClipMixOutput").resolve()),
+    "output_dir": str((Path.home() / "media/audio" / APP_NAME).resolve()),
     "encoding": {"cbr": None, "mono": False, "vbr_quality": 2},
     "xfade": {"seconds": 1.0, "shape": "tri"},
 }
