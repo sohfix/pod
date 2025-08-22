@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-import argparse, csv, json, os, re, subprocess, sys, tempfile
+"""
+clip — cut podcast/audio clips; supports batch, concat, and crossfade.
+
+Notes:
+- Requires the ffmpeg executable. Install via your OS package manager (apt/pacman/dnf/zypper/brew/choco).
+- 'pip install ffmpeg' does NOT install the ffmpeg binary.
+- You can set a custom binary with:
+    clip set --ffmpeg-bin /path/to/ffmpeg
+  or via environment variable:
+    FFMPEG_BIN=/path/to/ffmpeg clip run ...
+"""
+import argparse, csv, json, os, re, subprocess, sys, tempfile, shutil
 from pathlib import Path
 from typing import Optional, Tuple, List
 
@@ -8,52 +19,81 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "apps/.app-dat
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 TIME_PATTERNS = [
-    re.compile(r"^(?P<m>\d+):(?P<s>[0-5]?\d)$"),                 # M:SS
-    re.compile(r"^(?P<h>\d+):(?P<m>[0-5]?\d):(?P<s>[0-5]?\d)$"), # H:MM:SS
-    re.compile(r"^(?P<s>\d+)$"),                                 # seconds
+    re.compile(r"^(?P<m>\d+):(?P<s>[0-5]?\d(?:\.\d+)?)$"),                 # M:SS(.ms)
+    re.compile(r"^(?P<h>\d+):(?P<m>[0-5]?\d):(?P<s>[0-5]?\d(?:\.\d+)?)$"), # H:MM:SS(.ms)
+    re.compile(r"^(?P<s>\d+(?:\.\d+)?)$"),                                 # seconds(.ms)
 ]
+
 
 def parse_time(ts: str) -> float:
     s = ts.strip()
     for pat in TIME_PATTERNS:
         m = pat.match(s)
         if m:
-            h = int(m.groupdict().get("h") or 0)
-            m_ = int(m.groupdict().get("m") or 0)
-            s_ = int(m.groupdict().get("s") or 0)
+            h = float(m.groupdict().get("h") or 0)
+            m_ = float(m.groupdict().get("m") or 0)
+            s_ = float(m.groupdict().get("s") or 0)
             return h * 3600 + m_ * 60 + s_
     raise ValueError(f"Invalid time format: {ts!r}")
 
+
 def load_config() -> dict:
     if CONFIG_PATH.exists():
-        try: return json.loads(CONFIG_PATH.read_text())
-        except Exception: pass
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            pass
     return {}
 
 def save_config(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
+def find_ffmpeg(cfg: dict) -> str:
+    """
+    Resolve an ffmpeg binary path in this priority:
+      1) env FFMPEG_BIN
+      2) config["ffmpeg_bin"]
+      3) PATH: ffmpeg
+      4) PATH: avconv (fallback)
+    """
+    cand = os.environ.get("FFMPEG_BIN") or cfg.get("ffmpeg_bin")
+    if cand and shutil.which(cand):
+        return shutil.which(cand)  # normalized absolute path
+    for name in ("ffmpeg", "avconv"):
+        p = shutil.which(name)
+        if p:
+            return p
+    raise FileNotFoundError(
+        "ffmpeg binary not found. Install it with your package manager "
+        "(e.g. apt/pacman/dnf/zypper/brew/choco). "
+        "Note: 'pip install ffmpeg' does NOT install the ffmpeg executable."
+    )
+
 def ensure_outdir(path: Optional[str], cfg: dict) -> Path:
     outdir = Path(path) if path else Path(cfg.get("output_default", "."))
-    outdir.mkdir(parents=True, exist_ok=True); return outdir
+    outdir.mkdir(parents=True, exist_ok=True)
+    return outdir
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
 
-def run_ffmpeg_cut(input_mp3: Path, start_s: float, end_s: float, out_path: Path,
+def run_ffmpeg_cut(ffbin: str, input_mp3: Path, start_s: float, end_s: float, out_path: Path,
                    title: Optional[str] = None, comment: Optional[str] = None,
                    copy: bool = False) -> None:
-    if end_s <= start_s: raise ValueError("end must be greater than start")
+    if end_s <= start_s:
+        raise ValueError("end must be greater than start")
     duration = end_s - start_s
-    codec_args = ["-c", "copy"] if copy else ["-acodec", "libmp3lame", " -q:a", "2"]
+    codec_args = ["-c", "copy"] if copy else ["-acodec", "libmp3lame", "-q:a", "2"]
     # Note: using VBR (-q:a 2) for good quality; swap to -b:a 192k if you prefer CBR
     meta = []
-    if title:   meta += ["-metadata", f"title={title}"]
-    if comment: meta += ["-metadata", f"comment={comment}"]
+    if title:
+        meta += ["-metadata", f"title={title}"]
+    if comment:
+        meta += ["-metadata", f"comment={comment}"]
     cmd = [
-        "ffmpeg","-hide_banner","-loglevel","error",
-        "-ss", f"{start_s:.3f}","-t", f"{duration:.3f}",
+        ffbin, "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{start_s:.3f}", "-t", f"{duration:.3f}",
         "-i", str(input_mp3),
         *codec_args, *meta, str(out_path)
     ]
@@ -73,23 +113,33 @@ def parse_batch_file(path: Path) -> Tuple[str, List[dict]]:
       2:35,3:33,funny_bit,Hosts crack up
       420,505,,
     """
-    default_desc = ""; clips = []
+    default_desc = ""
+    clips = []
     with path.open(newline="", encoding="utf-8") as f:
-        reader = csv.reader(f); first_row = None
+        reader = csv.reader(f)
+        first_row = None
         for raw in reader:
-            if not raw or (len(raw) == 1 and not raw[0].strip()): continue
-            if raw[0].strip().startswith("#default"):
-                if len(raw) >= 2: default_desc = ",".join(raw[1:]).strip()
+            if not raw or (len(raw) == 1 and not raw[0].strip()):
                 continue
-            if raw[0].strip().startswith("#"): continue
+            if raw[0].strip().startswith("#default"):
+                if len(raw) >= 2:
+                    default_desc = ",".join(raw[1:]).strip()
+                continue
+            if raw[0].strip().startswith("#"):
+                continue
             if first_row is None:
                 first_row = raw
-                if sniff_has_header(first_row): first_row = None; continue
-            row = raw if first_row is None else first_row; first_row = None
+                if sniff_has_header(first_row):
+                    first_row = None
+                    continue
+            row = raw if first_row is None else first_row
+            first_row = None
             row = (row + ["", "", "", ""])[:4]
             start, end, name, desc = [c.strip() for c in row]
-            if not start or not end: raise ValueError(f"Batch row missing start/end: {row}")
-            start_s = parse_time(start); end_s = parse_time(end)
+            if not start or not end:
+                raise ValueError(f"Batch row missing start/end: {row}")
+            start_s = parse_time(start)
+            end_s = parse_time(end)
             nm = sanitize_filename(name) if name else ""
             description = default_desc if (desc == "#default" or desc == "") else desc
             clips.append({"start_s": start_s, "end_s": end_s, "name": nm, "description": description})
@@ -99,18 +149,20 @@ def derive_outfile(base_dir: Path, base_name: Optional[str], idx: int) -> Path:
     stem = sanitize_filename(base_name) if base_name else f"clip_{idx:02d}"
     return base_dir / f"{stem}.mp3"
 
-def ffmpeg_concat_list(list_file: Path, out_path: Path, copy: bool,
+def ffmpeg_concat_list(ffbin: str, list_file: Path, out_path: Path, copy: bool,
                        title: Optional[str], comment: Optional[str]) -> None:
-    codec_args = ["-c","copy"] if copy else ["-acodec","libmp3lame","-q:a","2"]
+    codec_args = ["-c", "copy"] if copy else ["-acodec", "libmp3lame", "-q:a", "2"]
     meta = []
-    if title:   meta += ["-metadata", f"title={title}"]
-    if comment: meta += ["-metadata", f"comment={comment}"]
-    cmd = ["ffmpeg","-hide_banner","-loglevel","error","-f","concat","-safe","0",
-           "-i",str(list_file),*codec_args,*meta,str(out_path)]
+    if title:
+        meta += ["-metadata", f"title={title}"]
+    if comment:
+        meta += ["-metadata", f"comment={comment}"]
+    cmd = [ffbin, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+           "-i", str(list_file), *codec_args, *meta, str(out_path)]
     if subprocess.run(cmd).returncode != 0:
         raise RuntimeError(f"ffmpeg concat failed for {out_path.name}")
 
-def ffmpeg_concat_xfade(parts: List[Path], out_path: Path, xfade: float,
+def ffmpeg_concat_xfade(ffbin: str, parts: List[Path], out_path: Path, xfade: float,
                         title: Optional[str], comment: Optional[str]) -> None:
     """
     Build an acrossfade chain over N inputs:
@@ -120,17 +172,20 @@ def ffmpeg_concat_xfade(parts: List[Path], out_path: Path, xfade: float,
       map last [afX]
     """
     if len(parts) == 1:
-        cmd = ["ffmpeg","-hide_banner","-loglevel","error","-i",str(parts[0]),
-               "-acodec","libmp3lame","-q:a","2"]
-        if title:   cmd += ["-metadata", f"title={title}"]
-        if comment: cmd += ["-metadata", f"comment={comment}"]
+        cmd = [ffbin, "-hide_banner", "-loglevel", "error", "-y",
+               "-i", str(parts[0]), "-acodec", "libmp3lame", "-q:a", "2"]
+        if title:
+            cmd += ["-metadata", f"title={title}"]
+        if comment:
+            cmd += ["-metadata", f"comment={comment}"]
         cmd += [str(out_path)]
         if subprocess.run(cmd).returncode != 0:
             raise RuntimeError(f"ffmpeg failed for {out_path.name}")
         return
 
-    cmd = ["ffmpeg","-hide_banner","-loglevel","error"]
-    for p in parts: cmd += ["-i", str(p)]
+    cmd = [ffbin, "-hide_banner", "-loglevel", "error", "-y"]
+    for p in parts:
+        cmd += ["-i", str(p)]
 
     filters = []
     prev = "0:a"
@@ -142,9 +197,11 @@ def ffmpeg_concat_xfade(parts: List[Path], out_path: Path, xfade: float,
         prev = out
     filter_complex = ";".join(filters)
 
-    out_args = ["-map", f"[{prev}]", "-acodec","libmp3lame","-q:a","2"]
-    if title:   out_args += ["-metadata", f"title={title}"]
-    if comment: out_args += ["-metadata", f"comment={comment}"]
+    out_args = ["-map", f"[{prev}]", "-acodec", "libmp3lame", "-q:a", "2"]
+    if title:
+        out_args += ["-metadata", f"title={title}"]
+    if comment:
+        out_args += ["-metadata", f"comment={comment}"]
 
     cmd += ["-filter_complex", filter_complex, *out_args, str(out_path)]
     if subprocess.run(cmd).returncode != 0:
@@ -156,9 +213,19 @@ def cmd_set(args):
         cfg["output_default"] = str(Path(args.output_default).expanduser())
         save_config(cfg)
         print(f"Set output default to: {cfg['output_default']}")
+    if getattr(args, "ffmpeg_bin", None):
+        cfg["ffmpeg_bin"] = args.ffmpeg_bin
+        save_config(cfg)
+        print(f"Set ffmpeg binary to: {cfg['ffmpeg_bin']}")
 
 def cmd_run(args):
     cfg = load_config()
+    # Resolve ffmpeg early so we fail fast with a helpful error
+    try:
+        ffbin = find_ffmpeg(cfg)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr); sys.exit(127)
+
     if not args.input:
         print("error: -i/--input is required", file=sys.stderr); sys.exit(2)
     input_mp3 = Path(args.input).expanduser()
@@ -168,11 +235,13 @@ def cmd_run(args):
 
     # SINGLE CLIP (no concat)
     if args.start and args.end and not args.concat:
-        start_s = parse_time(args.start); end_s = parse_time(args.end)
+        start_s = parse_time(args.start)
+        end_s = parse_time(args.end)
         name = sanitize_filename(args.name) if args.name else f"{input_mp3.stem}_{int(start_s)}-{int(end_s)}"
         out_path = outdir / f"{name}.mp3"
-        run_ffmpeg_cut(input_mp3, start_s, end_s, out_path, title=args.name or name, comment=args.info, copy=args.copy)
-        print(f"wrote {out_path}"); return
+        run_ffmpeg_cut(ffbin, input_mp3, start_s, end_s, out_path, title=args.name or name, comment=args.info, copy=args.copy)
+        print(f"wrote {out_path}")
+        return
 
     # BATCH
     if args.file:
@@ -192,7 +261,7 @@ def cmd_run(args):
                 # always cut parts; for xfade we re-encode final output
                 for i, c in enumerate(clips, 1):
                     part_path = tmp_dir / f"part_{i:02d}.mp3"
-                    run_ffmpeg_cut(input_mp3, c["start_s"], c["end_s"], part_path,
+                    run_ffmpeg_cut(ffbin, input_mp3, c["start_s"], c["end_s"], part_path,
                                    title=f"{merged_name}_part_{i:02d}",
                                    comment=c.get("description") or args.info or default_desc,
                                    copy=args.copy if not args.xfade else False)
@@ -200,6 +269,7 @@ def cmd_run(args):
 
                 if args.xfade and len(parts) >= 2:
                     ffmpeg_concat_xfade(
+                        ffbin=ffbin,
                         parts=parts,
                         out_path=merged_out,
                         xfade=args.xfade,
@@ -210,8 +280,10 @@ def cmd_run(args):
                     # plain concat (can stream copy if requested)
                     list_file = tmp_dir / "concat.txt"
                     with list_file.open("w", encoding="utf-8") as lf:
-                        for p in parts: lf.write(f"file '{p.as_posix()}'\n")
+                        for p in parts:
+                            lf.write(f"file '{p.as_posix()}'\n")
                     ffmpeg_concat_list(
+                        ffbin=ffbin,
                         list_file=list_file, out_path=merged_out, copy=args.copy,
                         title=merged_name, comment=args.info or default_desc
                     )
@@ -221,21 +293,26 @@ def cmd_run(args):
                 if args.keep_clips:
                     clips_dir = outdir / f"{merged_name}_parts"
                     clips_dir.mkdir(exist_ok=True)
-                    for p in parts: p.replace(clips_dir / p.name)
+                    for p in parts:
+                        p.replace(clips_dir / p.name)
                     print(f"kept parts in {clips_dir}")
             finally:
                 if not args.keep_clips:
                     for p in tmp_dir.glob("*"):
-                        try: p.unlink()
-                        except: pass
-                    try: tmp_dir.rmdir()
-                    except: pass
+                        try:
+                            p.unlink()
+                        except:
+                            pass
+                    try:
+                        tmp_dir.rmdir()
+                    except:
+                        pass
             return
 
         # normal batch (no concat)
         for i, c in enumerate(clips, 1):
             out_path = derive_outfile(outdir, c.get("name"), i)
-            run_ffmpeg_cut(input_mp3, c["start_s"], c["end_s"], out_path,
+            run_ffmpeg_cut(ffbin, input_mp3, c["start_s"], c["end_s"], out_path,
                            title=out_path.stem,
                            comment=c.get("description") or args.info or default_desc,
                            copy=args.copy)
@@ -249,7 +326,7 @@ def make_parser():
     p = argparse.ArgumentParser(prog=APP_NAME, description="Cut podcast clips from MP3s; batch, concat, crossfade.")
     sub = p.add_subparsers(dest="cmd")
 
-    pr = sub.add_parser("run", help="Run podmix")
+    pr = sub.add_parser("run", help="Run clip")
     pr.add_argument("-i","--input", help="Input MP3 file")
     pr.add_argument("--start", help="Start time (M:SS, H:MM:SS, or seconds)")
     pr.add_argument("--end", help="End time (M:SS, H:MM:SS, or seconds)")
@@ -280,18 +357,29 @@ def make_parser():
 
     ps = sub.add_parser("set", help="Set defaults")
     ps.add_argument("--output-default", help="Default output directory")
+    ps.add_argument("--ffmpeg-bin", help="Path to ffmpeg binary (else env FFMPEG_BIN or PATH)")
     ps.set_defaults(func=cmd_set)
     return p
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     parser = make_parser()
-    if argv and argv[0] not in {"run","set"}: argv = ["run"] + argv
+    if argv and argv[0] not in {"run","set"}:
+        argv = ["run"] + argv
     args = parser.parse_args(argv)
-    if not hasattr(args, "func"): parser.print_help(); return 2
-    try: return args.func(args) or 0
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 2
+    try:
+        return args.func(args) or 0
     except (ValueError, RuntimeError) as e:
-        print(f"error: {e}", file=sys.stderr); return 1
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except FileNotFoundError as e:
+        # For missing ffmpeg (raised in find_ffmpeg)
+        print(f"error: {e}", file=sys.stderr)
+        return 127
 
 if __name__ == "__main__":
     sys.exit(main())
+
