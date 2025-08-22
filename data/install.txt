@@ -34,7 +34,13 @@ _>source ~/.bashrc
 ## If required, reload env:
 _>source ~/$HOME/apps/.app-data/.venvs/.media/bin/activate
 
+
 #### RECOMMENDED FILE SETTINGS ####
+
 _>mkdir -p ~/media/audio/default/clip-2-extreme
 _>mkdir -p ~/media/audio/default/clip
 _>mkdir -p ~/media/audio/default/clip2-extreme-tui
+_>mkdir -p ~/apps/.app-data/.config-files/clip-2-extreme
+_>mkdir -p ~/apps/.app-data/.config-files/clip
+_>mkdir -p ~/apps/.app-data/.config-files/clip2-extreme-tui
+
