@@ -25,8 +25,8 @@ from textual.widgets import (
 )
 from textual.reactive import reactive
 
-APP_NAME = "ClipMix"
-CONFIG_DIR = Path.home() / ".config" / "clipmix"
+APP_NAME = "clip2extreme"
+CONFIG_DIR = Path.home() / "apps/.app-data/.config-files/.clip_config" / "clip2extreme"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 DEFAULT_CONFIG = {
