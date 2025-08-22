@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 
 APP_NAME = "clip"
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "~/apps/.app-data/.config-files")) / APP_NAME
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "apps/.app-data/.config-files")) / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 TIME_PATTERNS = [
