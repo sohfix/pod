@@ -3,8 +3,8 @@
 podmix — cut podcast clips; batch, concat, crossfade, gaps, loudness.
 
 Quick examples:
-  # Single clip with safe edges
-  podmix -i INPUT.mp3 --start 3:50 --end 4:50 --name intro --edge-fade 0.02
+  # Single clip with safe edges (millisecond precision supported)
+  podmix -i INPUT.mp3 --start 3:50.250 --end 4:50.750 --name intro --edge-fade 0.02
 
   # Batch (CSV) → individual files
   podmix -i INPUT.mp3 -f clips.csv
@@ -21,7 +21,7 @@ from typing import Optional, Tuple, List
 
 APP_NAME   = "clip2extreme"
 APP_DESC   = "Cut podcast clips from MP3s; batch, concat, crossfade, gaps, loudness."
-APP_VER    = "1.5.0"
+APP_VER    = "1.6.0"
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "apps/.app-data/.config-files")) / APP_NAME
 CONFIG_PATH= CONFIG_DIR / "config.json"
@@ -44,17 +44,18 @@ General:
   podmix help set
 
 Single clip:
-  podmix -i INPUT.mp3 --start "3:50" --end "4:50" --name intro
-  podmix -i INPUT.mp3 --start 235 --end 300 --name funny_bit --edge-fade 0.02
-  podmix -i INPUT.mp3 --start 3:55 --end 4:55 --name teaser --mono --cbr 192k
+  # Times accept M:SS(.ms), H:MM:SS(.ms), or seconds(.ms)
+  podmix -i INPUT.mp3 --start "3:50.250" --end "4:50.750" --name intro
+  podmix -i INPUT.mp3 --start 235.1 --end 300.9 --name funny_bit --edge-fade 0.02
+  podmix -i INPUT.mp3 --start 3:55 --end 4:55.500 --name teaser --mono --cbr 192k
 
 Batch (CSV format):
   # clips.csv
   #default, Highlights from the episode
   start,end,name,description
-  3:55,4:55,hot_take,#default
-  2:35,3:33,funny_bit,Hosts crack up
-  420,505,,
+  3:55,4:55.250,hot_take,#default
+  2:35.100,3:33.900,funny_bit,Hosts crack up
+  420.0,505.5,,
 
   podmix -i INPUT.mp3 -f clips.csv
 
@@ -91,22 +92,30 @@ def print_topic_help_and_exit(parser: argparse.ArgumentParser, topic: Optional[s
 
 # ---------- Utilities ----------
 
+# Updated to support milliseconds:
+# - M:SS(.ms)
+# - H:MM:SS(.ms)
+# - seconds(.ms)
 TIME_PATTERNS = [
-    re.compile(r"^(?P<m>\d+):(?P<s>[0-5]?\d)$"),                 # M:SS
-    re.compile(r"^(?P<h>\d+):(?P<m>[0-5]?\d):(?P<s>[0-5]?\d)$"), # H:MM:SS
-    re.compile(r"^(?P<s>\d+)$"),                                 # seconds (int)
+    re.compile(r"^(?P<m>\d+):(?P<s>[0-5]?\d(?:\.\d+)?)$"),                 # M:SS(.ms)
+    re.compile(r"^(?P<h>\d+):(?P<m>[0-5]?\d):(?P<s>[0-5]?\d(?:\.\d+)?)$"), # H:MM:SS(.ms)
+    re.compile(r"^(?P<s>\d+(?:\.\d+)?)$"),                                 # seconds(.ms)
 ]
 
 def parse_time(ts: str) -> float:
+    """
+    Parse time strings with optional milliseconds.
+    Accepts: M:SS(.ms) | H:MM:SS(.ms) | seconds(.ms)
+    """
     s = ts.strip()
     for pat in TIME_PATTERNS:
         m = pat.match(s)
         if m:
-            h = int(m.groupdict().get("h") or 0)
-            m_ = int(m.groupdict().get("m") or 0)
-            s_ = int(m.groupdict().get("s") or 0)
-            return h * 3600 + m_ * 60 + s_
-    raise ValueError(f"Invalid time format: {ts!r}  (use M:SS, H:MM:SS, or seconds)")
+            h = float(m.groupdict().get("h") or 0)
+            m_ = float(m.groupdict().get("m") or 0)
+            s_ = float(m.groupdict().get("s") or 0)
+            return h * 3600.0 + m_ * 60.0 + s_
+    raise ValueError(f"Invalid time format: {ts!r}  (use M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
 
 def load_config() -> dict:
     if CONFIG_PATH.exists():
@@ -205,9 +214,9 @@ def parse_batch_file(path: Path) -> Tuple[str, List[dict]]:
     CSV format:
       #default, Your default description (optional; first such line wins)
       start,end,name,description
-      3:55,4:55,hot_take,#default
-      2:35,3:33,funny_bit,Hosts crack up
-      420,505,,
+      3:55.000,4:55.250,hot_take,#default
+      2:35.100,3:33.900,funny_bit,Hosts crack up
+      420.0,505.5,,
     """
     default_desc = ""
     clips: List[dict] = []
@@ -513,7 +522,7 @@ def make_parser() -> argparse.ArgumentParser:
         formatter_class=_SmartFormatter,
         epilog=_dedent("""\
             Tips:
-              • Times accept M:SS, H:MM:SS, or raw seconds.
+              • Times accept M:SS(.ms), H:MM:SS(.ms), or raw seconds(.ms).
               • Use --copy for speed when you don't need fades/filters/mono/CBR.
               • CSV '#default, text...' sets a default description for empty/#default rows.
               • With --concat, prefer --xfade for smooth transitions or --gap for separation.
@@ -552,11 +561,12 @@ def make_parser() -> argparse.ArgumentParser:
                         Batch CSV with rows: start,end,name,description
                         Header is optional (auto-detected). Lines starting with '#default' set
                         a default description for rows that use '#default' or empty description.
+                        Times support milliseconds: M:SS(.ms), H:MM:SS(.ms), or seconds(.ms)
                     """))
 
     # Single-clip selection
-    pr.add_argument("--start", metavar="TIME", help="Start time (M:SS, H:MM:SS, or seconds)")
-    pr.add_argument("--end",   metavar="TIME", help="End time (M:SS, H:MM:SS, or seconds)")
+    pr.add_argument("--start", metavar="TIME", help="Start time (M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
+    pr.add_argument("--end",   metavar="TIME", help="End time (M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
 
     # Performance/accuracy
     pr.add_argument("--copy", action="store_true",
@@ -629,3 +639,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+

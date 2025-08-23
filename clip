@@ -23,6 +23,8 @@ from typing import Optional, Tuple, List
 
 APP_NAME = "clip"
 BATCH_DIR = Path.home() / "media/audio/batch-files"
+BATCH_DIR.mkdir(parents=True, exist_ok=True)
+
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "apps/.app-data/.config-files")) / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
@@ -91,6 +93,13 @@ def run_ffmpeg_cut(ffbin: str, input_mp3: Path, start_s: float, end_s: float, ou
     if end_s <= start_s:
         raise ValueError("end must be greater than start")
     dur = end_s - start_s
+
+    # optional: prevent fade settings longer than duration (clamp)
+    if fade_in < 0: fade_in = 0.0
+    if fade_out < 0: fade_out = 0.0
+    if fade_in + fade_out > dur:
+        fade_out = max(0.0, dur - fade_in)
+
     meta = []
     if title:
         meta += ["-metadata", f"title={title}"]
@@ -128,7 +137,6 @@ def run_ffmpeg_cut(ffbin: str, input_mp3: Path, start_s: float, end_s: float, ou
 
 def sniff_has_header(row: List[str]) -> bool:
     joined = ",".join(c.strip().lower() for c in row)
-    # accept any of these 'start'/'end' cues in header
     return "start" in joined and "end" in joined
 
 def parse_batch_file(path: Path) -> Tuple[str, List[dict]]:
@@ -297,10 +305,15 @@ def cmd_run(args):
 
     # BATCH
     if args.file:
-        batch_path = (BATCH_DIR / args.file).expanduser()
+        f_in = Path(args.file).expanduser()
+        batch_path = f_in if f_in.is_absolute() else (BATCH_DIR / f_in)
+        if batch_path.suffix.lower() != ".csv":
+            batch_path = batch_path.with_suffix(".csv")
 
         if not batch_path.exists():
             print(f"error: batch file not found: {batch_path}", file=sys.stderr); sys.exit(2)
+        print(f"using batch file: {batch_path}")
+
         default_desc, clips = parse_batch_file(batch_path)
         if not clips:
             print("no clips found in batch file", file=sys.stderr); sys.exit(2)

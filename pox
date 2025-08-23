@@ -891,7 +891,7 @@ def build_parser() -> argparse.ArgumentParser:
     # download
     p = sub.add_parser("download", help="Download episodes from a feed")
     p.add_argument("--feed", required=True, help="Feed short name")
-    p.add_argument("--latest", type=int, default=1, help="Download latest N not-yet-downloaded episodes (default: 1)")
+    p.add_argument("-L","--latest", type=int, default=1, help="Download latest N not-yet-downloaded episodes (default: 1)")
     p.add_argument("--all", action="store_true", help="Download all not-yet-downloaded episodes")
     p.add_argument("--ids", help="Comma-separated episode IDs to download")
     p.add_argument("--since", help="Only episodes with pub_date >= ISO date (e.g., 2024-01-01)")
