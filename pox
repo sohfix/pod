@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+# todo fix errors/bugs:
+# b0001- Queue does not clear after queue-download command runs.
+#
+#
+#
+#
+ 
 """
 pox — CLI Podcast Manager (RSS-only, single-file)
 
