@@ -3,8 +3,10 @@ certifi==2025.7.14
 charset-normalizer==3.4.2
 click==8.2.1
 feedparser==6.0.11
+ffmpeg==1.4
 fuzzywuzzy==0.18.0
 idna==3.10
+instaloader==4.14.2
 isort==6.0.1
 Levenshtein==0.27.1
 linkify-it-py==2.0.3
