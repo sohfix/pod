@@ -13,7 +13,7 @@ Quick examples:
   podmix -i INPUT.mp3 -f clips.csv --concat --name highlight_reel --xfade 1.0 --loudnorm -16
 
   # Set a default output directory
-  podmix set --output-default ~/media/audio/default/clip-2-extreme
+  clipex set --output-default ~/media/audio/clipex
 """
 import argparse, csv, json, os, re, subprocess, sys, tempfile, textwrap
 from pathlib import Path
