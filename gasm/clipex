@@ -1,36 +1,54 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-podmix — cut podcast clips; batch, concat, crossfade, gaps, loudness.
+clipex — cut podcast/music clips; batch, concat, crossfade, gaps, loudness, and work in named spaces.
 
 Quick examples:
   # Single clip with safe edges (millisecond precision supported)
-  podmix -i INPUT.mp3 --start 3:50.250 --end 4:50.750 --name intro --edge-fade 0.02
+  clipex -i INPUT.mp3 --start 3:50.250 --end 4:50.750 --name intro --edge-fade 0.02
+
+  # Play clip after cutting
+  clipex -i INPUT.mp3 --start 10 --end 20 --name sample --play
 
   # Batch (CSV) → individual files
-  podmix -i INPUT.mp3 -f clips.csv
+  clipex -i INPUT.mp3 -f clips.csv
 
   # Batch → one highlight reel with 1.0s crossfades + loudness target
-  podmix -i INPUT.mp3 -f clips.csv --concat --name highlight_reel --xfade 1.0 --loudnorm -16
+  clipex -i INPUT.mp3 -f clips.csv --concat --name highlight_reel --xfade 1.0 --loudnorm -16
 
   # Concat existing clips (skip cutting)
-  podmix --parts clipA.mp3 clipB.mp3 clipC.mp3 --concat --name mega_mix --xfade 0.75 --loudnorm -16
+  clipex --parts clipA.mp3 clipB.mp3 clipC.mp3 --concat --name mega_mix --xfade 0.75 --loudnorm -16
 
   # Multi-input CSV with per-row source
-  podmix -i ep1.mp3 -i ep2.mp3 -i ep3.mp3 -f clips.csv --concat --name supercut --xfade 1.0
+  clipex -i ep1.mp3 -i ep2.mp3 -i ep3.mp3 -f clips.csv --concat --name supercut --xfade 1.0
 
   # Set a default output directory
   clipex set --output-default ~/media/audio/clipex
-"""
-import argparse, csv, json, os, re, subprocess, sys, tempfile, textwrap
-from pathlib import Path
-from typing import Optional, Tuple, List
 
-APP_NAME   = "clip2extreme"
-APP_DESC   = "Cut podcast clips from MP3s; batch, concat, crossfade, gaps, loudness."
-APP_VER    = "1.6.0"
+  # Work in spaces (namespaces)
+  clipex space create mypod
+  clipex space set --in ~/Podcasts/mypod --out ~/Clips/mypod
+  clipex space start mypod
+  clipex -i episode01.mp3 -f cuts.csv --concat --name ep01_supercut   # uses space I/O by default
+  clipex space list
+  clipex space end
+"""
+
+import argparse, csv, json, os, re, subprocess, sys, tempfile, textwrap, shutil, platform
+from pathlib import Path
+from typing import Optional, Tuple, List, Dict, Any
+
+APP_NAME   = "clipex"
+APP_DESC   = "Cut podcast/music clips from MP3s; batch, concat, crossfade, gaps, loudness, and spaces."
+APP_VER    = "1.7.0"
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "apps/.app-data/.config-files")) / APP_NAME
 CONFIG_PATH= CONFIG_DIR / "config.json"
+
+# Globals toggled by CLI
+VERBOSE   = False
+OVERWRITE = False
 
 # ---------- Help & UX ----------
 
@@ -41,19 +59,20 @@ class _SmartFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHe
 def _dedent(s: str) -> str:
     return textwrap.dedent(s).strip("\n")
 
-EXAMPLES_TEXT = _dedent("""
+EXAMPLES_TEXT = _dedent(f"""
 General:
-  podmix --help
-  podmix --version
-  podmix --examples
-  podmix help run
-  podmix help set
+  {APP_NAME} --help
+  {APP_NAME} --version
+  {APP_NAME} --examples
+  {APP_NAME} help run
+  {APP_NAME} help set
+  {APP_NAME} help space
 
 Single clip:
   # Times accept M:SS(.ms), H:MM:SS(.ms), or seconds(.ms)
-  podmix -i INPUT.mp3 --start "3:50.250" --end "4:50.750" --name intro
-  podmix -i INPUT.mp3 --start 235.1 --end 300.9 --name funny_bit --edge-fade 0.02
-  podmix -i INPUT.mp3 --start 3:55 --end 4:55.500 --name teaser --mono --cbr 192k
+  {APP_NAME} -i INPUT.mp3 --start "3:50.250" --end "4:50.750" --name intro
+  {APP_NAME} -i INPUT.mp3 --start 235.1 --end 300.9 --name funny_bit --edge-fade 0.02
+  {APP_NAME} -i INPUT.mp3 --start 3:55 --end 4:55.500 --name teaser --mono --cbr 192k --play
 
 Batch (CSV format):
   # clips.csv
@@ -63,7 +82,7 @@ Batch (CSV format):
   2:35.100,3:33.900,funny_bit,Hosts crack up
   420.0,505.5,,
 
-  podmix -i INPUT.mp3 -f clips.csv
+  {APP_NAME} -i INPUT.mp3 -f clips.csv
 
 Multi-input CSV (per-row 'source' optional):
   # clips.csv
@@ -73,25 +92,33 @@ Multi-input CSV (per-row 'source' optional):
   2:35.100,3:33.900,ep2_funny,Hosts crack up,ep2.mp3
   420.0,505.5,ep3_reflection,,ep3.mp3
 
-  podmix -i ep1.mp3 -i ep2.mp3 -i ep3.mp3 -f clips.csv --concat --name supercut --xfade 1.0 --loudnorm -16
+  {APP_NAME} -i ep1.mp3 -i ep2.mp3 -i ep3.mp3 -f clips.csv --concat --name supercut --xfade 1.0
 
 Concat (one highlight reel):
-  podmix -i INPUT.mp3 -f clips.csv --concat --name highlight_reel
+  {APP_NAME} -i INPUT.mp3 -f clips.csv --concat --name highlight_reel
 
 Concat + crossfade + loudness:
-  podmix -i INPUT.mp3 -f clips.csv --concat --name highlight_reel --xfade 1.0 --loudnorm -16
+  {APP_NAME} -i INPUT.mp3 -f clips.csv --concat --name highlight_reel --xfade 1.0 --loudnorm -16
 
 Concat + gaps (no crossfade):
-  podmix -i INPUT.mp3 -f clips.csv --concat --gap 0.25 --name teaser_mix
+  {APP_NAME} -i INPUT.mp3 -f clips.csv --concat --gap 0.25 --name teaser_mix
 
 Keep the cut parts too:
-  podmix -i INPUT.mp3 -f clips.csv --concat --xfade 1.0 --keep-clips
+  {APP_NAME} -i INPUT.mp3 -f clips.csv --concat --xfade 1.0 --keep-clips
 
 Concat existing clips (skip cutting):
-  podmix --parts clipA.mp3 clipB.mp3 clipC.mp3 --concat --name mega_mix --xfade 0.75 --loudnorm -16
+  {APP_NAME} --parts clipA.mp3 clipB.mp3 clipC.mp3 --concat --name mega_mix --xfade 0.75 --loudnorm -16
 
 Set defaults:
-  podmix set --output-default ~/PodmixClips
+  {APP_NAME} set --output-default ~/ClipexClips
+
+Spaces:
+  {APP_NAME} space create myshow
+  {APP_NAME} space set --in ~/Podcasts/myshow --out ~/Clips/myshow
+  {APP_NAME} space start myshow
+  {APP_NAME} -i ep001.mp3 --start 30 --end 90 --name opener
+  {APP_NAME} space list
+  {APP_NAME} space end
 """)
 
 def print_examples_and_exit():
@@ -99,8 +126,8 @@ def print_examples_and_exit():
     sys.exit(0)
 
 def print_topic_help_and_exit(parser: argparse.ArgumentParser, topic: Optional[str]):
-    # topic can be "run" or "set" or None
-    if not topic or topic.lower() not in {"run", "set"}:
+    # topic can be "run" or "set" or "space" or None
+    if not topic or topic.lower() not in {"run", "set", "space"}:
         parser.print_help()
         sys.exit(0)
     # find the subparser by name and print its help
@@ -108,6 +135,85 @@ def print_topic_help_and_exit(parser: argparse.ArgumentParser, topic: Optional[s
     sp = subparsers_action.choices[topic.lower()]
     sp.print_help()
     sys.exit(0)
+
+# ---------- Config & Spaces ----------
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+def get_spaces(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return cfg.setdefault("spaces", {})
+
+def get_current_space(cfg: Dict[str, Any]) -> Optional[str]:
+    return cfg.get("current_space")
+
+def set_current_space(cfg: Dict[str, Any], name: Optional[str]) -> None:
+    if name is None:
+        cfg.pop("current_space", None)
+    else:
+        cfg["current_space"] = name
+    save_config(cfg)
+
+def ensure_outdir(path: Optional[str], cfg: dict) -> Path:
+    """
+    Resolves the output directory in priority:
+      1) --output
+      2) current space's 'out'
+      3) configured default (clipex set --output-default DIR)
+      4) current directory
+    Creates the directory if missing.
+    """
+    out = None
+    if path:
+        out = Path(path).expanduser()
+    else:
+        cur = get_current_space(cfg)
+        if cur:
+            out = Path(get_spaces(cfg).get(cur, {}).get("out", "")) if get_spaces(cfg).get(cur, {}).get("out") else None
+        if not out:
+            out = Path(cfg.get("output_default", "."))
+
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+def resolve_input_path(user_path: str, cfg: dict) -> Path:
+    """
+    Resolve an input path, trying as given; if not found and current space has 'in', try under that.
+    """
+    p = Path(user_path).expanduser()
+    if p.exists():
+        return p
+    cur = get_current_space(cfg)
+    if cur:
+        in_base = get_spaces(cfg).get(cur, {}).get("in")
+        if in_base:
+            p2 = Path(in_base).expanduser() / user_path
+            if p2.exists():
+                return p2
+    return p  # will be validated by callers
+
+# ---------- ffmpeg helpers ----------
+
+def ffmpeg_base_args() -> List[str]:
+    args = ["-hide_banner"]
+    args += ["-loglevel", "info" if VERBOSE else "error"]
+    if OVERWRITE:
+        args += ["-y"]
+    return args
+
+def run_subprocess(cmd: List[str]) -> int:
+    if VERBOSE:
+        print(">>", " ".join(cmd))
+    return subprocess.run(cmd).returncode
 
 # ---------- Utilities ----------
 
@@ -136,28 +242,6 @@ def parse_time(ts: str) -> float:
             return h * 3600.0 + m_ * 60.0 + s_
     raise ValueError(f"Invalid time format: {ts!r}  (use M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
 
-def load_config() -> dict:
-    if CONFIG_PATH.exists():
-        try: return json.loads(CONFIG_PATH.read_text())
-        except Exception: pass
-    return {}
-
-def save_config(cfg: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
-
-def ensure_outdir(path: Optional[str], cfg: dict) -> Path:
-    """
-    Resolves the output directory in priority:
-      1) --output
-      2) configured default (podmix set --output-default DIR)
-      3) current directory
-    Creates the directory if missing.
-    """
-    outdir = Path(path) if path else Path(cfg.get("output_default", "."))
-    outdir.mkdir(parents=True, exist_ok=True)
-    return outdir
-
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
 
@@ -174,6 +258,35 @@ def choose_encode_args(cbr: Optional[str], mono: bool) -> List[str]:
     if mono:
         args += ["-ac", "1"]
     return args
+
+# ---------- Player ----------
+
+def find_player() -> Optional[List[str]]:
+    """
+    Returns a command list for a suitable audio player (blocking preferred).
+    Tries: ffplay -autoexit, afplay (macOS), mpg123, cvlc, play (sox), powershell WMPlayer fallback.
+    """
+    if shutil.which("ffplay"):
+        return ["ffplay", *ffmpeg_base_args(), "-autoexit"]
+    if platform.system() == "Darwin" and shutil.which("afplay"):
+        return ["afplay"]
+    if shutil.which("mpg123"):
+        return ["mpg123", "-q"]
+    if shutil.which("cvlc"):
+        return ["cvlc", "--play-and-exit", "--quiet"]
+    if shutil.which("play"):  # from sox
+        return ["play", "-q"]
+    # Windows basic fallback using start (non-blocking) – still acceptable
+    if platform.system() == "Windows":
+        return ["cmd", "/c", "start", ""]
+    return None
+
+def play_file(path: Path) -> None:
+    cmd = find_player()
+    if not cmd:
+        print(f"note: no suitable audio player found to play {path}", file=sys.stderr)
+        return
+    run_subprocess(cmd + [str(path)])
 
 # ---------- Cutting & parsing ----------
 
@@ -201,7 +314,7 @@ def run_ffmpeg_cut(
     if comment: meta += ["-metadata", f"comment={comment}"]
 
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "ffmpeg", *ffmpeg_base_args(),
         "-ss", f"{start_s:.3f}", "-t", f"{duration:.3f}",
         "-i", str(input_mp3),
     ]
@@ -221,7 +334,7 @@ def run_ffmpeg_cut(
             print(f"note: re-encoding {out_path.name} (copy disabled by --edge-fade/--cbr)")
 
     cmd += filter_args + codec_args + meta + [str(out_path)]
-    if subprocess.run(cmd).returncode != 0:
+    if run_subprocess(cmd) != 0:
         raise RuntimeError(f"ffmpeg failed for {out_path.name}")
 
 def sniff_has_header(row: List[str]) -> bool:
@@ -287,13 +400,13 @@ def make_silence_mp3(path: Path, duration: float, cbr: Optional[str], mono: bool
     if duration <= 0:
         return
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "ffmpeg", *ffmpeg_base_args(),
         "-f", "lavfi", "-t", f"{duration:.3f}",
         "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         *choose_encode_args(cbr=cbr, mono=mono),
         str(path)
     ]
-    if subprocess.run(cmd).returncode != 0:
+    if run_subprocess(cmd) != 0:
         raise RuntimeError("failed to generate silence clip")
 
 def build_xfade_filter(n_parts: int, xfade: float, shape: str,
@@ -337,7 +450,7 @@ def ffmpeg_concat_list(list_file: Path, out_path: Path, copy: bool,
     if title:   meta += ["-metadata", f"title={title}"]
     if comment: meta += ["-metadata", f"comment={comment}"]
 
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+    cmd = ["ffmpeg", *ffmpeg_base_args(),
            "-f", "concat", "-safe", "0", "-i", str(list_file)]
 
     must_encode = bool(filter_a) or mono or not copy or bool(cbr)
@@ -349,7 +462,7 @@ def ffmpeg_concat_list(list_file: Path, out_path: Path, copy: bool,
         cmd += ["-c", "copy"]
 
     cmd += meta + [str(out_path)]
-    if subprocess.run(cmd).returncode != 0:
+    if run_subprocess(cmd) != 0:
         raise RuntimeError(f"ffmpeg concat failed for {out_path.name}")
 
 def ffmpeg_concat_xfade(parts: List[Path], out_path: Path, xfade: float, shape: str,
@@ -360,7 +473,7 @@ def ffmpeg_concat_xfade(parts: List[Path], out_path: Path, xfade: float, shape: 
     Multi-input, filter_complex acrossfade with optional limiter/loudnorm.
     Always re-encodes the final output.
     """
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    cmd = ["ffmpeg", *ffmpeg_base_args()]
     for p in parts:
         cmd += ["-i", str(p)]
 
@@ -378,21 +491,26 @@ def ffmpeg_concat_xfade(parts: List[Path], out_path: Path, xfade: float, shape: 
     if title:   cmd += ["-metadata", f"title={title}"]
     if comment: cmd += ["-metadata", f"comment={comment}"]
     cmd += [str(out_path)]
-    if subprocess.run(cmd).returncode != 0:
+    if run_subprocess(cmd) != 0:
         raise RuntimeError(f"ffmpeg xfade failed for {out_path.name}")
 
 # ---------- Commands ----------
 
 def cmd_set(args):
-    """Implements `podmix set`."""
+    """Implements `clipex set`."""
     cfg = load_config()
     if args.output_default:
         cfg["output_default"] = str(Path(args.output_default).expanduser())
         save_config(cfg)
         print(f"Set output default to: {cfg['output_default']}")
 
+def _validate_inputs_exist(inputs: List[Path]):
+    for p in inputs:
+        if not p.exists():
+            print(f"error: input file not found: {p}", file=sys.stderr); sys.exit(2)
+
 def cmd_run(args):
-    """Implements `podmix run` (default)."""
+    """Implements `clipex run` (default)."""
     cfg = load_config()
     if args.examples:
         print_examples_and_exit()
@@ -405,7 +523,7 @@ def cmd_run(args):
     inputs: List[Path] = []
     if args.input:
         for i in args.input:
-            p = Path(i).expanduser()
+            p = resolve_input_path(i, cfg)
             if not p.exists():
                 print(f"error: input file not found: {p}", file=sys.stderr); sys.exit(2)
             inputs.append(p)
@@ -433,13 +551,15 @@ def cmd_run(args):
         if args.mono and copy:
             print("note: --mono requires re-encode; ignoring --copy for single clip")
         print(f"wrote {out_path}")
+        if args.play:
+            play_file(out_path)
         return
 
     # PARTS-ONLY CONCAT: build a supercut from existing clip files
     if args.parts:
         parts = []
         for mp in args.parts:
-            p = Path(mp).expanduser()
+            p = resolve_input_path(mp, cfg)
             if not p.exists():
                 print(f"error: part not found: {p}", file=sys.stderr); sys.exit(2)
             parts.append(p)
@@ -467,7 +587,7 @@ def cmd_run(args):
             print(f"wrote {merged_out}")
         else:
             # optionally insert gaps
-            tmp_dir = Path(tempfile.mkdtemp(prefix="podmix_", dir=str(outdir)))
+            tmp_dir = Path(tempfile.mkdtemp(prefix="clipex_", dir=str(outdir)))
             try:
                 if args.gap > 0 and len(parts) >= 2:
                     interleaved = []
@@ -507,11 +627,13 @@ def cmd_run(args):
                     except: pass
                 try: tmp_dir.rmdir()
                 except: pass
+        if args.play:
+            play_file(merged_out)
         return
 
     # BATCH / CONCAT
     if args.file:
-        batch_path = Path(args.file).expanduser()
+        batch_path = resolve_input_path(args.file, cfg)
         if not batch_path.exists():
             print(f"error: batch file not found: {batch_path}", file=sys.stderr); sys.exit(2)
 
@@ -522,14 +644,14 @@ def cmd_run(args):
         # Prepare cut parts
         tmp_dir = None
         if args.concat:
-            tmp_dir = Path(tempfile.mkdtemp(prefix="podmix_", dir=str(outdir)))
+            tmp_dir = Path(tempfile.mkdtemp(prefix="clipex_", dir=str(outdir)))
         try:
             parts: List[Path] = []
             for i, c in enumerate(clips, 1):
                 # resolve source for this row:
                 src_text = c.get("source") or ""
                 if src_text:
-                    src_path = Path(src_text).expanduser()
+                    src_path = resolve_input_path(src_text, cfg)
                     if not src_path.exists():
                         print(f"error: source not found for row {i}: {src_path}", file=sys.stderr); sys.exit(2)
                     input_mp3 = src_path
@@ -557,6 +679,9 @@ def cmd_run(args):
                     print(f"wrote {part_path}")
 
             if not args.concat:
+                if args.play and parts:
+                    print("note: --play with batch (no --concat) will play only the last written clip.")
+                    play_file(parts[-1])
                 return
 
             # CONCAT PATH
@@ -625,6 +750,9 @@ def cmd_run(args):
                     p.replace(clips_dir / p.name)
                 print(f"kept parts in {clips_dir}")
 
+            if args.play:
+                play_file(merged_out)
+
         finally:
             if tmp_dir and (not args.keep_clips):
                 for p in tmp_dir.glob("*"):
@@ -636,6 +764,89 @@ def cmd_run(args):
 
     print("error: provide --start and --end for a single clip, or -f/--file for batch/concat, or --parts for existing clips.", file=sys.stderr)
     sys.exit(2)
+
+# ---------- Spaces subcommands ----------
+
+def cmd_space(args):
+    """
+    clipex space [create NAME | start NAME | end [NAME] | set (--in DIR | --out DIR | --list-io) | list | change NAME | delete NAME]
+    """
+    cfg = load_config()
+    spaces = get_spaces(cfg)
+
+    if args.action == "create":
+        name = args.name
+        if not name:
+            print("error: space create requires a NAME", file=sys.stderr); sys.exit(2)
+        if name in spaces:
+            print(f"error: space '{name}' already exists", file=sys.stderr); sys.exit(2)
+        spaces[name] = {"in": "", "out": ""}
+        save_config(cfg)
+        print(f"created space '{name}'")
+
+    elif args.action in {"start", "change"}:
+        name = args.name
+        if not name:
+            print(f"error: space {args.action} requires a NAME", file=sys.stderr); sys.exit(2)
+        if name not in spaces:
+            print(f"error: space '{name}' not found", file=sys.stderr); sys.exit(2)
+        set_current_space(cfg, name)
+        print(f"current space: {name}")
+
+    elif args.action == "end":
+        name = args.name
+        cur = get_current_space(cfg)
+        if name and name != cur:
+            print(f"error: space '{name}' is not the current space (current is '{cur}')", file=sys.stderr); sys.exit(2)
+        set_current_space(cfg, None)
+        print("cleared current space")
+
+    elif args.action == "set":
+        cur = get_current_space(cfg)
+        if not cur:
+            print("error: no current space. Use 'clipex space start NAME' first.", file=sys.stderr); sys.exit(2)
+        sp = spaces.setdefault(cur, {"in": "", "out": ""})
+        changed = False
+        if args.in_dir:
+            sp["in"] = str(Path(args.in_dir).expanduser())
+            changed = True
+        if args.out_dir:
+            sp["out"] = str(Path(args.out_dir).expanduser())
+            changed = True
+        if changed:
+            save_config(cfg)
+            print(f"updated space '{cur}': in={sp.get('in') or '(unset)'} out={sp.get('out') or '(unset)'}")
+        if args.list_io or not changed:
+            print(f"space '{cur}' I/O:")
+            print(f"  in : {sp.get('in') or '(unset)'}")
+            print(f"  out: {sp.get('out') or '(unset)'}")
+
+    elif args.action == "list":
+        cur = get_current_space(cfg)
+        if not spaces:
+            print("(no spaces)")
+            return
+        for name, meta in spaces.items():
+            star = "*" if name == cur else " "
+            print(f"{star} {name}")
+            if VERBOSE:
+                print(f"    in : {meta.get('in') or '(unset)'}")
+                print(f"    out: {meta.get('out') or '(unset)'}")
+
+    elif args.action == "delete":
+        name = args.name
+        if not name:
+            print("error: space delete requires a NAME", file=sys.stderr); sys.exit(2)
+        if name not in spaces:
+            print(f"error: space '{name}' not found", file=sys.stderr); sys.exit(2)
+        if get_current_space(cfg) == name:
+            set_current_space(cfg, None)
+        spaces.pop(name, None)
+        save_config(cfg)
+        print(f"deleted space '{name}'")
+
+    else:
+        print("error: unknown space action", file=sys.stderr); sys.exit(2)
 
 # ---------- CLI ----------
 
@@ -652,6 +863,7 @@ def make_parser() -> argparse.ArgumentParser:
               • With --concat, prefer --xfade for smooth transitions or --gap for separation.
               • You can pass multiple -i/--input, and/or use a per-row 'source' in CSV.
               • Or skip cutting entirely with --parts to merge existing clips.
+              • Use 'clipex space' to organize input/output defaults per project.
             """),
         add_help=False  # we'll add -h/--help manually to include in all subparsers too
     )
@@ -660,14 +872,16 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("-h","--help", action="help", help="Show this help message and exit")
     p.add_argument("--version", action="version", version=f"%(prog)s {APP_VER}", help="Show version and exit")
     p.add_argument("--examples", action="store_true", help="Print practical usage recipes and exit")
+    p.add_argument("-y","--yes", action="store_true", help="Overwrite output files without asking (passes -y to ffmpeg)")
+    p.add_argument("-v","--verbose", action="store_true", help="Verbose output (show ffmpeg commands, list space I/O)")
 
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND", title="Commands")
 
     # ---- run ----
     pr = sub.add_parser(
-        "run", help="Run podmix (default)", formatter_class=_SmartFormatter, add_help=False,
+        "run", help="Run clipex (default)", formatter_class=_SmartFormatter, add_help=False,
         description=_dedent("""\
-            Run podmix to cut clips from MP3s.
+            Run clipex to cut clips from MP3s.
             Modes:
               • Single clip:   --start + --end (outputs one file, requires exactly one -i)
               • Batch:         -f/--file CSV (outputs many files)
@@ -680,8 +894,9 @@ def make_parser() -> argparse.ArgumentParser:
 
     # IO
     pr.add_argument("-i","--input", metavar="FILE", action="append",
-                    help="Input MP3 file. Can be given multiple times; rows without a 'source' column use the first.")
-    pr.add_argument("-o","--output", metavar="DIR", help="Output directory (see 'set' for default)")
+                    help="Input MP3 file. Can be given multiple times; rows without a 'source' column use the first. Resolved against current space's 'in' if set.")
+    pr.add_argument("-o","--output", metavar="DIR", help="Output directory (falls back to current space's 'out', then global default)")
+
     pr.add_argument("--name", metavar="NAME", help="Output file name (single clip) or merged name with --concat")
     pr.add_argument("--info", metavar="TEXT", help="Optional description/notes for metadata")
     pr.add_argument("-f","--file", metavar="CSV",
@@ -689,7 +904,8 @@ def make_parser() -> argparse.ArgumentParser:
                         Batch CSV with rows: start,end,name,description[,source]
                         Header is optional (auto-detected). Lines starting with '#default' set
                         a default description for rows that use '#default' or empty description.
-                        'source' (optional per row) can reference a different input file for that clip.
+                        'source' (optional per row) can reference a different input file for that clip
+                        and will be resolved against the current space's 'in' if set.
                         Times support milliseconds: M:SS(.ms), H:MM:SS(.ms), or seconds(.ms)
                     """))
     pr.add_argument("--parts", nargs="+", metavar="MP3",
@@ -722,29 +938,79 @@ def make_parser() -> argparse.ArgumentParser:
     pr.add_argument("--cbr", type=str, default=None, metavar="RATE",
                     help="Force constant bitrate for encoding (e.g., 192k). Default is VBR -q:a 2.")
 
+    # UX niceties
+    pr.add_argument("--play", action="store_true", help="Play the resulting clip/output after writing it")
+
     pr.set_defaults(func=cmd_run)
 
     # ---- set ----
     ps = sub.add_parser(
-        "set", help="Set defaults", formatter_class=_SmartFormatter, add_help=False,
-        description="Configure persistent defaults (stored under ~/.config/podmix/config.json)."
+        "set", help="Set global defaults", formatter_class=_SmartFormatter, add_help=False,
+        description=f"Configure persistent defaults (stored under {CONFIG_PATH})."
     )
     ps.add_argument("-h","--help", action="help", help="Show help for 'set' and exit")
-    ps.add_argument("--output-default", metavar="DIR", help="Default output directory for all runs")
+    ps.add_argument("--output-default", metavar="DIR", help="Default output directory for all runs (used when space 'out' and --output are not set)")
     ps.set_defaults(func=cmd_set)
+
+    # ---- space ----
+    pspace = sub.add_parser(
+        "space", help="Manage named spaces (namespaces) for I/O presets", add_help=False, formatter_class=_SmartFormatter,
+        description=_dedent("""\
+            Work with project 'spaces' (namespaces) that remember input/output directories.
+            Actions:
+              • create NAME        Create a space
+              • start NAME         Make space current (also: 'change')
+              • end [NAME]         Clear current space (NAME must match if provided)
+              • set [--in DIR] [--out DIR] [--list-io]   Update/list current space I/O
+              • list               List spaces (current one is marked with *)
+              • delete NAME        Remove a space
+        """)
+    )
+    pspace.add_argument("-h","--help", action="help", help="Show help for 'space' and exit")
+    space_sub = pspace.add_subparsers(dest="action", metavar="ACTION")
+
+    sp_create = space_sub.add_parser("create", help="Create a space", add_help=False)
+    sp_create.add_argument("name", help="Space name")
+    sp_create.set_defaults(func=cmd_space)
+
+    sp_start = space_sub.add_parser("start", help="Start/use a space", add_help=False)
+    sp_start.add_argument("name", help="Space name")
+    sp_start.set_defaults(func=cmd_space)
+
+    sp_change = space_sub.add_parser("change", help="Alias of start", add_help=False)
+    sp_change.add_argument("name", help="Space name")
+    sp_change.set_defaults(func=cmd_space)
+
+    sp_end = space_sub.add_parser("end", help="Clear current space", add_help=False)
+    sp_end.add_argument("name", nargs="?", help="(optional) Must match current space if provided")
+    sp_end.set_defaults(func=cmd_space)
+
+    sp_set = space_sub.add_parser("set", help="Set I/O for current space", add_help=False)
+    sp_set.add_argument("--in", dest="in_dir", metavar="DIR", help="Default input base directory for current space")
+    sp_set.add_argument("--out", dest="out_dir", metavar="DIR", help="Default output directory for current space")
+    sp_set.add_argument("--list-io", action="store_true", help="List current space I/O")
+    sp_set.set_defaults(func=cmd_space)
+
+    sp_list = space_sub.add_parser("list", help="List spaces", add_help=False)
+    sp_list.set_defaults(func=cmd_space)
+
+    sp_delete = space_sub.add_parser("delete", help="Delete a space", add_help=False)
+    sp_delete.add_argument("name", help="Space name")
+    sp_delete.set_defaults(func=cmd_space)
 
     # ---- help (topic-aware) ----
     ph = sub.add_parser(
-        "help", help="Show top-level help or topic help (run | set)",
+        "help", help="Show top-level help or topic help (run | set | space)",
         formatter_class=_SmartFormatter, add_help=False
     )
     ph.add_argument("-h","--help", action="help", help="Show help for 'help' and exit")
-    ph.add_argument("topic", nargs="?", help="Help topic: run | set")
+    ph.add_argument("topic", nargs="?", help="Help topic: run | set | space")
     ph.set_defaults(func=lambda a: print_topic_help_and_exit(p, a.topic))
 
     return p
 
 def main(argv=None):
+    global VERBOSE, OVERWRITE
     argv = sys.argv[1:] if argv is None else argv
     parser = make_parser()
 
@@ -753,10 +1019,14 @@ def main(argv=None):
         print_examples_and_exit()
 
     # Convenience: if first token isn't a subcommand, treat as 'run'
-    if argv and argv[0] not in {"run","set","help"}:
+    if argv and argv[0] not in {"run","set","help","space"}:
         argv = ["run"] + argv
 
     args = parser.parse_args(argv)
+
+    # set globals
+    VERBOSE = bool(getattr(args, "verbose", False))
+    OVERWRITE = bool(getattr(args, "yes", False))
 
     # 'help' subcommand already exits; others continue
     if not hasattr(args, "func"):
@@ -770,3 +1040,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
