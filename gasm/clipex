@@ -12,6 +12,12 @@ Quick examples:
   # Batch → one highlight reel with 1.0s crossfades + loudness target
   podmix -i INPUT.mp3 -f clips.csv --concat --name highlight_reel --xfade 1.0 --loudnorm -16
 
+  # Concat existing clips (skip cutting)
+  podmix --parts clipA.mp3 clipB.mp3 clipC.mp3 --concat --name mega_mix --xfade 0.75 --loudnorm -16
+
+  # Multi-input CSV with per-row source
+  podmix -i ep1.mp3 -i ep2.mp3 -i ep3.mp3 -f clips.csv --concat --name supercut --xfade 1.0
+
   # Set a default output directory
   clipex set --output-default ~/media/audio/clipex
 """
@@ -59,6 +65,16 @@ Batch (CSV format):
 
   podmix -i INPUT.mp3 -f clips.csv
 
+Multi-input CSV (per-row 'source' optional):
+  # clips.csv
+  #default, Supercut across three pods
+  start,end,name,description,source
+  3:55,4:55.250,ep1_hot_take,#default,ep1.mp3
+  2:35.100,3:33.900,ep2_funny,Hosts crack up,ep2.mp3
+  420.0,505.5,ep3_reflection,,ep3.mp3
+
+  podmix -i ep1.mp3 -i ep2.mp3 -i ep3.mp3 -f clips.csv --concat --name supercut --xfade 1.0 --loudnorm -16
+
 Concat (one highlight reel):
   podmix -i INPUT.mp3 -f clips.csv --concat --name highlight_reel
 
@@ -70,6 +86,9 @@ Concat + gaps (no crossfade):
 
 Keep the cut parts too:
   podmix -i INPUT.mp3 -f clips.csv --concat --xfade 1.0 --keep-clips
+
+Concat existing clips (skip cutting):
+  podmix --parts clipA.mp3 clipB.mp3 clipC.mp3 --concat --name mega_mix --xfade 0.75 --loudnorm -16
 
 Set defaults:
   podmix set --output-default ~/PodmixClips
@@ -211,12 +230,12 @@ def sniff_has_header(row: List[str]) -> bool:
 
 def parse_batch_file(path: Path) -> Tuple[str, List[dict]]:
     """
-    CSV format:
+    CSV format (now allows optional 'source' per row):
       #default, Your default description (optional; first such line wins)
-      start,end,name,description
-      3:55.000,4:55.250,hot_take,#default
-      2:35.100,3:33.900,funny_bit,Hosts crack up
-      420.0,505.5,,
+      start,end,name,description[,source]
+      3:55.000,4:55.250,hot_take,#default,ep1.mp3
+      2:35.100,3:33.900,funny_bit,Hosts crack up,ep2.mp3
+      420.0,505.5,,,
     """
     default_desc = ""
     clips: List[dict] = []
@@ -239,14 +258,22 @@ def parse_batch_file(path: Path) -> Tuple[str, List[dict]]:
                     continue
             row = raw if first_row is None else first_row
             first_row = None
-            row = (row + ["", "", "", ""])[:4]
-            start, end, name, desc = [c.strip() for c in row]
+
+            # normalize to up to 5 cols: start,end,name,description,source?
+            row = (row + ["", "", "", "", ""])[:5]
+            start, end, name, desc, source = [c.strip() for c in row[:5]]
             if not start or not end:
                 raise ValueError(f"Batch row missing start/end: {row}")
             start_s = parse_time(start); end_s = parse_time(end)
             nm = sanitize_filename(name) if name else ""
             description = default_desc if (desc == "#default" or desc == "") else desc
-            clips.append({"start_s": start_s, "end_s": end_s, "name": nm, "description": description})
+            clips.append({
+                "start_s": start_s,
+                "end_s": end_s,
+                "name": nm,
+                "description": description,
+                "source": source,
+            })
     return default_desc, clips
 
 def derive_outfile(base_dir: Path, base_name: Optional[str], idx: int) -> Path:
@@ -370,15 +397,26 @@ def cmd_run(args):
     if args.examples:
         print_examples_and_exit()
 
-    if not args.input:
-        print("error: -i/--input is required", file=sys.stderr); sys.exit(2)
-    input_mp3 = Path(args.input).expanduser()
-    if not input_mp3.exists():
-        print(f"error: input file not found: {input_mp3}", file=sys.stderr); sys.exit(2)
+    # guard: incompatible combos
+    if args.parts and (args.file or args.start or args.end):
+        print("error: --parts cannot be combined with --start/--end or -f/--file", file=sys.stderr); sys.exit(2)
+
+    # resolve inputs list (may be None, 1+, or unused when every CSV row has a source)
+    inputs: List[Path] = []
+    if args.input:
+        for i in args.input:
+            p = Path(i).expanduser()
+            if not p.exists():
+                print(f"error: input file not found: {p}", file=sys.stderr); sys.exit(2)
+            inputs.append(p)
+
     outdir = ensure_outdir(args.output, cfg)
 
     # SINGLE CLIP (no concat)
-    if args.start and args.end and not args.concat:
+    if args.start and args.end and not args.concat and not args.parts and not args.file:
+        if len(inputs) != 1:
+            print("error: single-clip mode requires exactly one -i/--input", file=sys.stderr); sys.exit(2)
+        input_mp3 = inputs[0]
         start_s = parse_time(args.start); end_s = parse_time(args.end)
         name = sanitize_filename(args.name) if args.name else f"{input_mp3.stem}_{int(start_s)}-{int(end_s)}"
         out_path = outdir / f"{name}.mp3"
@@ -395,6 +433,80 @@ def cmd_run(args):
         if args.mono and copy:
             print("note: --mono requires re-encode; ignoring --copy for single clip")
         print(f"wrote {out_path}")
+        return
+
+    # PARTS-ONLY CONCAT: build a supercut from existing clip files
+    if args.parts:
+        parts = []
+        for mp in args.parts:
+            p = Path(mp).expanduser()
+            if not p.exists():
+                print(f"error: part not found: {p}", file=sys.stderr); sys.exit(2)
+            parts.append(p)
+
+        if not args.concat:
+            # if user forgot --concat, assume they wanted one file
+            args.concat = True
+
+        merged_name = sanitize_filename(args.name) if args.name else "supercut"
+        merged_out = outdir / f"{merged_name}.mp3"
+
+        if args.xfade > 0 and len(parts) >= 2:
+            ffmpeg_concat_xfade(
+                parts=parts,
+                out_path=merged_out,
+                xfade=args.xfade,
+                shape=args.xfade_shape,
+                title=merged_name,
+                comment=args.info,
+                cbr=args.cbr,
+                mono=args.mono,
+                add_limiter=True,
+                loudnorm_i=(args.loudnorm if args.loudnorm is not None else None)
+            )
+            print(f"wrote {merged_out}")
+        else:
+            # optionally insert gaps
+            tmp_dir = Path(tempfile.mkdtemp(prefix="podmix_", dir=str(outdir)))
+            try:
+                if args.gap > 0 and len(parts) >= 2:
+                    interleaved = []
+                    for idx, p in enumerate(parts):
+                        interleaved.append(p)
+                        if idx < len(parts) - 1:
+                            sfile = tmp_dir / f"silence_{idx:02d}.mp3"
+                            make_silence_mp3(sfile, args.gap, cbr=args.cbr, mono=False)
+                            interleaved.append(sfile)
+                    parts = interleaved
+
+                list_file = tmp_dir / "concat.txt"
+                with list_file.open("w", encoding="utf-8") as lf:
+                    for p in parts:
+                        lf.write(f"file '{p.as_posix()}'\n")
+
+                # Post-filter chain for final (limiter always on; loudnorm optional)
+                filter_chain = ["alimiter=limit=0.90"]
+                if args.loudnorm is not None:
+                    filter_chain.append(f"loudnorm=I={args.loudnorm}:TP=-1.5:LRA=11")
+                filter_a = ",".join(filter_chain) if filter_chain else None
+
+                ffmpeg_concat_list(
+                    list_file=list_file,
+                    out_path=merged_out,
+                    copy=args.copy and not filter_a and not args.mono and not args.cbr,
+                    title=merged_name,
+                    comment=args.info,
+                    filter_a=filter_a,
+                    cbr=args.cbr,
+                    mono=args.mono
+                )
+                print(f"wrote {merged_out}")
+            finally:
+                for p in tmp_dir.glob("*"):
+                    try: p.unlink()
+                    except: pass
+                try: tmp_dir.rmdir()
+                except: pass
         return
 
     # BATCH / CONCAT
@@ -414,6 +526,18 @@ def cmd_run(args):
         try:
             parts: List[Path] = []
             for i, c in enumerate(clips, 1):
+                # resolve source for this row:
+                src_text = c.get("source") or ""
+                if src_text:
+                    src_path = Path(src_text).expanduser()
+                    if not src_path.exists():
+                        print(f"error: source not found for row {i}: {src_path}", file=sys.stderr); sys.exit(2)
+                    input_mp3 = src_path
+                else:
+                    if not inputs:
+                        print("error: no input provided for row without 'source' (use -i/--input or add 'source' in CSV)", file=sys.stderr); sys.exit(2)
+                    input_mp3 = inputs[0]
+
                 if args.concat:
                     part_path = (tmp_dir / f"part_{i:02d}.mp3")
                 else:
@@ -436,7 +560,7 @@ def cmd_run(args):
                 return
 
             # CONCAT PATH
-            merged_name = sanitize_filename(args.name) if args.name else f"{input_mp3.stem}_highlights"
+            merged_name = sanitize_filename(args.name) if args.name else f"{Path(inputs[0]).stem if inputs else 'highlights'}_highlights"
             merged_out = outdir / f"{merged_name}.mp3"
 
             # If both xfade and gap provided, prefer xfade
@@ -510,7 +634,7 @@ def cmd_run(args):
                 except: pass
         return
 
-    print("error: provide --start and --end for a single clip, or -f/--file for batch/concat.", file=sys.stderr)
+    print("error: provide --start and --end for a single clip, or -f/--file for batch/concat, or --parts for existing clips.", file=sys.stderr)
     sys.exit(2)
 
 # ---------- CLI ----------
@@ -526,6 +650,8 @@ def make_parser() -> argparse.ArgumentParser:
               • Use --copy for speed when you don't need fades/filters/mono/CBR.
               • CSV '#default, text...' sets a default description for empty/#default rows.
               • With --concat, prefer --xfade for smooth transitions or --gap for separation.
+              • You can pass multiple -i/--input, and/or use a per-row 'source' in CSV.
+              • Or skip cutting entirely with --parts to merge existing clips.
             """),
         add_help=False  # we'll add -h/--help manually to include in all subparsers too
     )
@@ -541,28 +667,33 @@ def make_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser(
         "run", help="Run podmix (default)", formatter_class=_SmartFormatter, add_help=False,
         description=_dedent("""\
-            Run podmix to cut clips from an MP3.
+            Run podmix to cut clips from MP3s.
             Modes:
-              • Single clip:  --start + --end (outputs one file)
-              • Batch:        -f/--file CSV (outputs many files)
-              • Concat:       --concat on a batch (one highlight reel)
+              • Single clip:   --start + --end (outputs one file, requires exactly one -i)
+              • Batch:         -f/--file CSV (outputs many files)
+              • Concat:        --concat on a batch (one highlight reel)
+              • Parts concat:  --parts (skip cutting; just merge existing clips)
             """)
     )
     pr.add_argument("-h","--help", action="help", help="Show help for 'run' and exit")
     pr.add_argument("--examples", action="store_true", help="Show 'run' examples and exit")
 
     # IO
-    pr.add_argument("-i","--input", metavar="FILE", help="Input MP3 file")
+    pr.add_argument("-i","--input", metavar="FILE", action="append",
+                    help="Input MP3 file. Can be given multiple times; rows without a 'source' column use the first.")
     pr.add_argument("-o","--output", metavar="DIR", help="Output directory (see 'set' for default)")
     pr.add_argument("--name", metavar="NAME", help="Output file name (single clip) or merged name with --concat")
     pr.add_argument("--info", metavar="TEXT", help="Optional description/notes for metadata")
     pr.add_argument("-f","--file", metavar="CSV",
                     help=_dedent("""\
-                        Batch CSV with rows: start,end,name,description
+                        Batch CSV with rows: start,end,name,description[,source]
                         Header is optional (auto-detected). Lines starting with '#default' set
                         a default description for rows that use '#default' or empty description.
+                        'source' (optional per row) can reference a different input file for that clip.
                         Times support milliseconds: M:SS(.ms), H:MM:SS(.ms), or seconds(.ms)
                     """))
+    pr.add_argument("--parts", nargs="+", metavar="MP3",
+                    help="Existing clip files to concat (skip cutting). Incompatible with --start/--end and -f/--file.")
 
     # Single-clip selection
     pr.add_argument("--start", metavar="TIME", help="Start time (M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
@@ -639,4 +770,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
-
