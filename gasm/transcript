@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import sys
+import textwrap
+from pathlib import Path
+from typing import List, Optional, Dict, Set, Tuple
+
+from tqdm import tqdm
+
+# Use faster-whisper for accurate word timestamps
+#   pip install faster-whisper
+from faster_whisper import WhisperModel
+
+APP_NAME = "transcript"
+CONFIG_DIR = Path(os.getenv("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_NAME
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+LANG_CHOICES = {
+    "english": "en",
+    "french": "fr",
+    "spanish": "es",
+    "german": "de",
+    "italian": "it",
+}
+
+DEFAULT_MODEL = "small"  # faster-whisper model size: tiny/base/small/medium/large-v2 etc.
+
+# -------------------------
+# Config helpers
+# -------------------------
+def load_config() -> Dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+def save_config(cfg: Dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+# -------------------------
+# Common helpers
+# -------------------------
+def resolve_language(args) -> str:
+    if args.lang:
+        key = args.lang.lower()
+    else:
+        for k in LANG_CHOICES.keys():
+            if getattr(args, k, False):
+                key = k
+                break
+        else:
+            key = "english"
+    if key not in LANG_CHOICES:
+        raise SystemExit(f"Unsupported language: {key}")
+    return key
+
+def gather_files(files: Optional[List[str]], directory: Optional[str]) -> List[Path]:
+    candidates: Set[Path] = set()
+    if files:
+        for f in files:
+            p = Path(f).expanduser().resolve()
+            if p.is_file():
+                candidates.add(p)
+            else:
+                for g in p.parent.glob(p.name):
+                    if g.is_file():
+                        candidates.add(g.resolve())
+    if directory:
+        d = Path(directory).expanduser().resolve()
+        if not d.is_dir():
+            raise SystemExit(f"--dir not found or not a directory: {directory}")
+        for p in d.glob("**/*.mp3"):
+            if p.is_file():
+                candidates.add(p.resolve())
+    out = sorted(candidates)
+    return out
+
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+def load_model(name: str, compute_type: str = "auto") -> WhisperModel:
+    """
+    compute_type:
+      - "float16" for GPUs w/ FP16
+      - "int8" / "int8_float16" for CPUs
+      - "auto" lets faster-whisper pick
+    """
+    # device "auto" will choose GPU if available
+    return WhisperModel(name, device="auto", compute_type=compute_type)
+
+# -------------------------
+# Basic transcription (for `run`)
+# -------------------------
+def transcribe_plain(model: WhisperModel, audio_path: Path, lang_key: str) -> str:
+    language_code = LANG_CHOICES[lang_key]
+    segments, info = model.transcribe(
+        str(audio_path),
+        language=language_code,
+        vad_filter=True,
+        word_timestamps=False,  # plain text
+    )
+    out = []
+    for seg in segments:
+        out.append(seg.text.strip())
+    return (" ".join(out)).strip()
+
+def save_transcript_text(text: str, audio_path: Path, out_base_dir: Optional[Path], lang_key: str):
+    lang_code = LANG_CHOICES[lang_key]
+    stem = audio_path.stem
+    if out_base_dir:
+        ensure_dir(out_base_dir)
+        out_path = out_base_dir / f"{stem}.{lang_code}.txt"
+    else:
+        out_path = audio_path.with_suffix(f".{lang_code}.txt")
+    out_path.write_text(text + "\n", encoding="utf-8")
+    return out_path
+
+def cmd_run(args):
+    cfg = load_config()
+    files = gather_files(args.file, args.dir)
+    if not files:
+        raise SystemExit("No MP3 files found. Use -f/--file or --dir.")
+    lang_key = resolve_language(args)
+
+    model_name = args.model or DEFAULT_MODEL
+    try:
+        model = load_model(model_name, compute_type=args.compute_type)
+    except Exception as e:
+        raise SystemExit(f"Failed to load model '{model_name}'.\n{e}")
+
+    global_out_dir: Optional[Path] = None
+    if args.output_dir:
+        global_out_dir = Path(args.output_dir).expanduser().resolve()
+        ensure_dir(global_out_dir)
+    elif cfg.get("default_output_dir"):
+        global_out_dir = Path(cfg["default_output_dir"]).expanduser().resolve()
+        ensure_dir(global_out_dir)
+
+    print(
+        textwrap.dedent(
+            f"""
+            == transcript run ==
+            Files: {len(files)}
+            Language: {lang_key.capitalize()} ({LANG_CHOICES[lang_key]})
+            Model: {model_name}
+            Output: {"global -> " + str(global_out_dir) if global_out_dir else "alongside each file"}
+            """
+        ).strip()
+    )
+
+    failures = 0
+    for p in tqdm(files, desc="Transcribing", unit="file"):
+        try:
+            text = transcribe_plain(model, p, lang_key)
+            out_path = save_transcript_text(text, p, global_out_dir, lang_key)
+            if args.verbose:
+                print(f"\n--- {p.name} -> {out_path} ---\n{text[:400]}\n")
+        except Exception as e:
+            failures += 1
+            print(f"[ERROR] {p}: {e}", file=sys.stderr)
+
+    if failures:
+        print(f"\nCompleted with {failures} failure(s).", file=sys.stderr)
+    else:
+        print("\nAll done.")
+
+# -------------------------
+# Word-level indexing (for `find`)
+# -------------------------
+INDEX_SUFFIX = ".words.json"
+
+def normalize_token(s: str) -> str:
+    # Lowercase and strip punctuation (keep apostrophes/dashes inside words)
+    s = s.lower()
+    s = re.sub(r"[^\w'\-]+", " ", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip()
+
+def tokenize_phrase(phrase: str) -> List[str]:
+    return normalize_token(phrase).split()
+
+def transcribe_words(model: WhisperModel, audio_path: Path, lang_key: str) -> Dict:
+    """
+    Returns a dict with a word-level index:
+    {
+      "file": "...",
+      "language": "en",
+      "model": "small",
+      "words": [
+         {"text":"hello","start":1.23,"end":1.56,"orig":"Hello"},
+         ...
+      ]
+    }
+    """
+    language_code = LANG_CHOICES[lang_key]
+    segments, info = model.transcribe(
+        str(audio_path),
+        language=language_code,
+        vad_filter=True,
+        word_timestamps=True,
+    )
+
+    words = []
+    for seg in segments:
+        if seg.words:
+            for w in seg.words:
+                if w.word is None or w.start is None or w.end is None:
+                    continue
+                words.append({
+                    "text": normalize_token(w.word),
+                    "orig": w.word,
+                    "start": float(w.start),
+                    "end": float(w.end),
+                })
+        else:
+            # Fallback: approximate by splitting the segment text if no words provided
+            # (rare with faster-whisper when word_timestamps=True)
+            pass
+
+    return {
+        "file": str(audio_path),
+        "language": language_code,
+        "model": model._model_size if hasattr(model, "_model_size") else "unknown",
+        "words": words,
+    }
+
+def index_path_for(audio_path: Path) -> Path:
+    return audio_path.with_suffix(audio_path.suffix + INDEX_SUFFIX)
+
+def load_or_build_index(model: WhisperModel, audio_path: Path, lang_key: str, rebuild: bool=False) -> Dict:
+    ipath = index_path_for(audio_path)
+    if ipath.exists() and not rebuild:
+        try:
+            return json.loads(ipath.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    idx = transcribe_words(model, audio_path, lang_key)
+    ipath.write_text(json.dumps(idx), encoding="utf-8")
+    return idx
+
+def find_phrase_in_words(words: List[Dict], phrase_tokens: List[str]) -> List[Tuple[float, float, int, int]]:
+    """
+    Returns list of matches as (start_time, end_time, start_idx, end_idx)
+    """
+    matches = []
+    if not phrase_tokens:
+        return matches
+    # Create a list of just tokens for matching
+    tokens = [w["text"] for w in words]
+    n = len(tokens)
+    m = len(phrase_tokens)
+    if m == 0 or n == 0 or m > n:
+        return matches
+
+    # Sliding window exact match on normalized tokens
+    for i in range(n - m + 1):
+        if tokens[i:i+m] == phrase_tokens:
+            start_t = words[i]["start"]
+            end_t = words[i+m-1]["end"]
+            matches.append((start_t, end_t, i, i+m-1))
+    return matches
+
+def clamp_time(t: float) -> float:
+    return max(0.0, round(t, 3))
+
+def cmd_find(args):
+    files = gather_files(args.file, args.dir)
+    if not files:
+        raise SystemExit("No MP3 files found. Use -f/--file or --dir.")
+    if not args.phrase:
+        raise SystemExit("Use --phrase to search for a word or phrase.")
+
+    lang_key = resolve_language(args)
+    model_name = args.model or DEFAULT_MODEL
+    try:
+        model = load_model(model_name, compute_type=args.compute_type)
+    except Exception as e:
+        raise SystemExit(f"Failed to load model '{model_name}'.\n{e}")
+
+    phrase_tokens = tokenize_phrase(args.phrase)
+    pre = max(0.0, args.pre or 0.0)
+    post = max(0.0, args.post or 0.0)
+
+    all_results = []
+
+    print(
+        textwrap.dedent(
+            f"""
+            == transcript find ==
+            Files: {len(files)}
+            Language: {lang_key.capitalize()} ({LANG_CHOICES[lang_key]})
+            Model: {model_name}
+            Phrase: "{args.phrase}"
+            Buffer: pre={pre}s post={post}s
+            """
+        ).strip()
+    )
+
+    for p in tqdm(files, desc="Indexing & searching", unit="file"):
+        try:
+            idx = load_or_build_index(model, p, lang_key, rebuild=args.reindex)
+            words = idx.get("words", [])
+            matches = find_phrase_in_words(words, phrase_tokens)
+            file_results = []
+            for (start_t, end_t, i0, i1) in matches:
+                clip_start = clamp_time(start_t - pre)
+                clip_end   = clamp_time(end_t + post)
+                file_results.append({
+                    "file": str(p),
+                    "match_start": round(start_t, 3),
+                    "match_end": round(end_t, 3),
+                    "clip_start": clip_start,
+                    "clip_end": clip_end,
+                    "phrase": args.phrase,
+                    "first_word": words[i0]["orig"],
+                    "last_word": words[i1]["orig"],
+                    "first_word_index": i0,
+                    "last_word_index": i1,
+                })
+            if not args.json and file_results:
+                print(f"\n{p.name}:")
+                for r in file_results:
+                    print(f"  {r['clip_start']:>8.3f}s  →  {r['clip_end']:>8.3f}s"
+                          f"   (match {r['match_start']:.3f}–{r['match_end']:.3f}s)")
+            all_results.extend(file_results)
+            if not matches and not args.json:
+                print(f"\n{p.name}: no matches")
+        except Exception as e:
+            print(f"[ERROR] {p}: {e}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps(all_results, indent=2))
+
+# -------------------------
+# argparse wiring
+# -------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="transcript",
+        description="Transcribe MP3s and find phrases with timestamped clips.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # Common language options helper
+    def add_lang_options(ap):
+        ap.add_argument("--lang", choices=list(LANG_CHOICES.keys()), help="Language")
+        lang_group = ap.add_mutually_exclusive_group()
+        for lname in LANG_CHOICES.keys():
+            lang_group.add_argument(f"--{lname}", action="store_true", help=f"Shortcut for --lang {lname}")
+
+    # Common model/compute options
+    def add_model_options(ap):
+        ap.add_argument("--model", help="faster-whisper model size (tiny, base, small, medium, large-v2, etc.)")
+        ap.add_argument("--compute-type", default="auto",
+                        help="auto | float16 | int8 | int8_float16 | float32 (defaults to auto)")
+
+    # run
+    pr = sub.add_parser("run", help="Transcribe one or more MP3 files to text")
+    pr.add_argument("-f", "--file", nargs="+", help="MP3 file(s) or glob(s)")
+    pr.add_argument("--dir", help="Directory to scan for MP3 files (recursively)")
+    pr.add_argument("-o", "--output-dir", help="Write transcripts to this directory")
+    pr.add_argument("-v", "--verbose", action="store_true")
+    add_lang_options(pr)
+    add_model_options(pr)
+    pr.set_defaults(func=cmd_run)
+
+    # find
+    pf = sub.add_parser("find", help="Find a word/phrase and return buffered timestamp ranges")
+    pf.add_argument("-f", "--file", nargs="+", help="MP3 file(s) or glob(s)")
+    pf.add_argument("--dir", help="Directory to scan for MP3 files (recursively)")
+    pf.add_argument("--phrase", required=True, help="Word or quoted phrase to search (case/punct insensitive)")
+    pf.add_argument("--pre", type=float, default=2.0, help="Seconds of buffer before the phrase")
+    pf.add_argument("--post", type=float, default=2.0, help="Seconds of buffer after the phrase")
+    pf.add_argument("--json", action="store_true", help="Output machine-readable JSON with all matches")
+    pf.add_argument("--reindex", action="store_true", help="Force rebuild of the word index JSON")
+    add_lang_options(pf)
+    add_model_options(pf)
+    pf.set_defaults(func=cmd_find)
+
+    # set
+    ps = sub.add_parser("set", help="Set defaults")
+    ps.add_argument("--default-output-dir", help="Directory to use by default for text transcripts")
+    ps.set_defaults(func=lambda a: (ensure_dir(Path(a.default_output_dir).expanduser().resolve()),
+                                    save_config({**load_config(), "default_output_dir": str(Path(a.default_output_dir).expanduser().resolve())})
+                                    ) if a.default_output_dir else print("Nothing to set. Use --default-output-dir PATH."))
+
+    return p
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
