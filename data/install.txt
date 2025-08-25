@@ -54,3 +54,39 @@ _>chmod +x pox clip clip2-extreme-tui clip-2-extreme
 
 ## PATH var
 _>export PATH="$HOME/.local/bin:/usr/local/bin:$HOME/apps/pod::$PATH"
+
+
+#### transcript
+- **Transcribe MP3s** to text (English default; also French, Spanish, German, Italian).
+- **Find words/phrases** and return **precise timestamps** with optional **buffer** before/after the hit.
+- Cache a **word-level index** so repeated searches are instant.
+- Output human-readable lines **or JSON** for scripting (e.g., auto-clipping with `ffmpeg`).
+
+---
+
+## Features
+
+- **Transcription** powered by `faster-whisper` (fast, accurate, per-word timestamps).
+- **Phrase search** across one file, many files, or entire directories.
+- **Buffered timestamp ranges** (e.g., 3s pre-roll / 5s post-roll).
+- **Cached word index** saved as `*.mp3.words.json` for instant re-search.
+- **Persistent defaults** (e.g., default output directory).
+- **Language options**: `english` (default), `french`, `spanish`, `german`, `italian`.
+
+---
+
+## Quickstart
+
+```bash
+# 1) Install system dependency
+# Debian/Ubuntu/Kali:
+sudo apt-get install -y ffmpeg
+# macOS (Homebrew):
+# brew install ffmpeg
+
+# 2) Install Python deps
+pip install -U faster-whisper tqdm
+
+# 3) Save the CLI
+# Download/save the provided single-file script as: transcript
+chmod +x transcript  # optional
