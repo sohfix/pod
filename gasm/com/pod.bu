@@ -1,55 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-## TODO:
-#
-
-"""
-pox — CLI Podcast Manager (RSS-only, single-file)
-
-🚦 RSS-only: This tool strictly supports RSS feeds (RSS 2.0-style).
-    - Root must be <rss> (optionally namespaced) containing <channel>/<item>.
-    - Atom feeds (<feed>) are rejected with an error.
-    - Each episode must be discoverable under <item>, and audio is taken from:
-        <enclosure url="..."> or <media:content url="..." type="audio/*">
-
-Features:
-- Init config/data dirs and PodFile (RSS feed URLs)
-- Manage feeds (list/add/remove/rename, set summary)
-- Refresh episodes (RSS-only) into a SQLite manifest
-- Info per feed (counts, last publish)
-- Search (single feed / all feeds)
-- Download episodes (by latest N, all, ids) and by title
-- Download queue (add/list/download/remove/reset)
-- Playlists (create/add/remove/list/show/export m3u)
-- Clean (clear download records per feed, optional file deletion)
-- **NEW**: yt-dlp helper: download YouTube/other links to audio (default) or video
-- **NEW**: Settings to control global base download dir and per-feed download dirs
-
-Examples:
-    pox init
-    pox add-feed myshow https://example.com/podcast.xml
-    pox list-feeds
-    pox refresh --feed myshow
-    pox search --feed myshow --query "episode 12"
-    pox download --feed myshow --latest 3
-    pox download-title --feed myshow --title "pilot"
-    pox queue-add --feed myshow --title "pilot"
-    pox queue-list
-    pox queue-download
-    pox playlist create favorites
-    pox playlist export favorites --out ~/favorites.m3u
-
-    # yt-dlp helpers
-    pox set --download-yt-dir ~/media/video/yt
-    pox download-yt --link https://www.youtube.com/watch?v=dQw4w9WgXcQ
-    pox download-yt --link https://www.youtube.com/watch?v=dQw4w9WgXcQ --video
-
-    # NEW settings
-    pox set --download-dir ~/media/audio/podcasts
-    pox set --change-feed-dir bastards --dir ~/DIRECTORY
-    pox set --unset-feed-dir bastards
-    pox set --show
-"""
 
 import argparse
 import configparser
@@ -72,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 # ---------- Paths & Constants ----------
 
-APP_NAME = "pox"
+APP_NAME = "podcast"
 DESC = "CLI Podcast Manager (RSS-only)"
 
 
@@ -93,7 +43,7 @@ PODFILE_PATH = os.path.join(CONFIG_DIR, "PodFile.ini")
 DOWNLOADS_DIR = os.path.expanduser("~/media/audio/default/pox")
 
 # Default yt-dlp downloads dir (can be overridden by `pox set --download-yt-dir`)
-DEFAULT_YT_DIR = os.path.expanduser("~/media/video/default/pox-yt")
+DEFAULT_YT_DIR = os.path.expanduser("~/media/yt")
 
 USER_AGENT = f"{APP_NAME}/1.0 (+https://example.invalid)"
 HTTP_TIMEOUT = 45
