@@ -1,0 +1,1648 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import configparser
+import contextlib
+import datetime as dt
+import email.utils
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import textwrap
+import time
+import traceback
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from typing import Dict, Iterable, List, Optional, Tuple
+
+# ---------- Paths & Constants ----------
+
+DATA_VERSION = "00001"
+APP_NAME = "podcast"
+DESC = "RSS-first podcast fetcher/downloader with queues & playlists"
+
+def xdg_path(env_key: str, default_sub: str) -> str:
+    """
+    Return a base path using XDG environment variable if set,
+    otherwise fallback to ~/default_sub. Always appends APP_NAME.
+    """
+    base = os.environ.get(env_key)
+    if base:
+        return os.path.join(os.path.expanduser(base), APP_NAME)
+    home = os.path.expanduser("~")
+    return os.path.join(home, default_sub, APP_NAME)
+
+# Config & data directories
+CONFIG_DIR = xdg_path("XDG_CONFIG_HOME", "apps/.app-data/.config-files/podcast")
+DATA_DIR = xdg_path("XDG_DATA_HOME", "apps/pod/data/rnddata")
+
+DB_PATH = os.path.join(DATA_DIR, f"{APP_NAME}-dv{DATA_VERSION}.db")
+PODFILE_PATH = os.path.join(CONFIG_DIR, "PODFILE.ini")
+
+# Default audio downloads go here (can be overridden by "download_dir" setting)
+DOWNLOADS_DIR = os.path.join(xdg_path("XDG_MUSIC_DIR", "media/audio/default/default-podcast"))
+
+# Default yt-dlp downloads dir (can be overridden by `podcast set --download-yt-dir`)
+DEFAULT_YT_DIR = xdg_path("XDG_VIDEOS_DIR", "media/yt")
+
+USER_AGENT = f"{APP_NAME}/1.0 (+https://example.invalid)"
+HTTP_TIMEOUT = 45
+
+SQL_PRAGMAS = [
+    "PRAGMA foreign_keys = ON",
+    "PRAGMA journal_mode = WAL",
+    "PRAGMA synchronous = NORMAL",
+]
+
+# ---------- Utilities ----------
+
+def eprint(*a, **k):
+    print(*a, file=sys.stderr, **k)
+
+def read_podfile() -> configparser.ConfigParser:
+    ensure_minimal_dirs_only()
+    cfg = configparser.ConfigParser()
+    if os.path.exists(PODFILE_PATH):
+        cfg.read(PODFILE_PATH)
+    else:
+        cfg["feeds"] = {}
+        cfg["summaries"] = {}
+        cfg["settings"] = {}
+        with open(PODFILE_PATH, "w", encoding="utf-8") as f:
+            cfg.write(f)
+    if "feeds" not in cfg:
+        cfg["feeds"] = {}
+    if "summaries" not in cfg:
+        cfg["summaries"] = {}
+    if "settings" not in cfg:
+        cfg["settings"] = {}
+    return cfg
+
+def write_podfile(cfg: configparser.ConfigParser):
+    ensure_minimal_dirs_only()
+    with open(PODFILE_PATH, "w", encoding="utf-8") as f:
+        cfg.write(f)
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    cfg = read_podfile()
+    return cfg.get("settings", key, fallback=default)
+
+def set_setting(key: str, value: Optional[str]):
+    cfg = read_podfile()
+    if "settings" not in cfg:
+        cfg["settings"] = {}
+    if value is None:
+        cfg["settings"].pop(key, None)
+    else:
+        cfg["settings"][key] = os.path.expanduser(value)
+    write_podfile(cfg)
+
+def ensure_minimal_dirs_only():
+    # Ensure config & data dirs exist before reading/writing PodFile / DB
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+# ---- Directory settings helpers ----
+
+def get_base_downloads_dir() -> str:
+    return os.path.expanduser(get_setting("download_dir", DOWNLOADS_DIR))
+
+def _feed_dir_key(feed: str) -> str:
+    return f"feed_dir.{feed}"
+
+def get_feed_download_dir(feed: str) -> str:
+    override = get_setting(_feed_dir_key(feed))
+    if override:
+        return os.path.expanduser(override)
+    return os.path.join(get_base_downloads_dir(), feed)
+
+def set_feed_download_dir(feed: str, path: str):
+    set_setting(_feed_dir_key(feed), path)
+
+def unset_feed_download_dir(feed: str):
+    set_setting(_feed_dir_key(feed), None)
+
+def list_feed_dir_overrides() -> Dict[str, str]:
+    cfg = read_podfile()
+    out: Dict[str, str] = {}
+    settings = cfg["settings"]
+    for k, v in settings.items():
+        if k.startswith("feed_dir."):
+            out[k.split(".", 1)[1]] = os.path.expanduser(v)
+    return out
+
+def ensure_dirs():
+    # Config/data dirs
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    # Global base audio dir (may be overridden later per-feed)
+    base = get_base_downloads_dir()
+    os.makedirs(base, exist_ok=True)
+
+    # Per-feed overrides
+    for _feed, path in list_feed_dir_overrides().items():
+        with contextlib.suppress(Exception):
+            os.makedirs(path, exist_ok=True)
+
+    # YT dir
+    yt_dir = get_setting("download_yt_dir", DEFAULT_YT_DIR)
+    if yt_dir:
+        os.makedirs(os.path.expanduser(yt_dir), exist_ok=True)
+
+def connect_db():
+    ensure_dirs()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    for p in SQL_PRAGMAS:
+        cur.execute(p)
+    # Create schema if not exists
+    cur.executescript(
+        """
+    CREATE TABLE IF NOT EXISTS feeds (
+        short_name TEXT PRIMARY KEY,
+        url TEXT NOT NULL,
+        custom_name TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS episodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        feed TEXT NOT NULL,
+        guid TEXT,
+        title TEXT,
+        pub_date TEXT,
+        enclosure_url TEXT,
+        link TEXT,
+        description TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(feed, guid),
+        FOREIGN KEY(feed) REFERENCES feeds(short_name) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS downloads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        feed TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        status TEXT NOT NULL,
+        size_bytes INTEGER,
+        downloaded_at TEXT NOT NULL,
+        FOREIGN KEY(episode_id) REFERENCES episodes(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        feed TEXT NOT NULL,
+        added_at TEXT NOT NULL,
+        FOREIGN KEY(episode_id) REFERENCES episodes(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS playlists (
+        name TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS playlist_items (
+        playlist_name TEXT NOT NULL,
+        episode_id INTEGER NOT NULL,
+        position INTEGER NOT NULL,
+        added_at TEXT NOT NULL,
+        PRIMARY KEY (playlist_name, episode_id),
+        FOREIGN KEY(playlist_name) REFERENCES playlists(name) ON DELETE CASCADE,
+        FOREIGN KEY(episode_id) REFERENCES episodes(id) ON DELETE CASCADE
+    );
+
+    -- Metadata for conditional HTTP (ETag/Last-Modified)
+    CREATE TABLE IF NOT EXISTS feed_meta (
+        feed TEXT PRIMARY KEY,
+        etag TEXT,
+        last_modified TEXT,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(feed) REFERENCES feeds(short_name) ON DELETE CASCADE
+    );
+
+    -- Helpful indices
+    CREATE INDEX IF NOT EXISTS idx_episodes_feed_pub ON episodes(feed, pub_date);
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_episodes_feed_guid ON episodes(feed, guid);
+    CREATE INDEX IF NOT EXISTS idx_downloads_ep_status ON downloads(episode_id, status);
+    CREATE INDEX IF NOT EXISTS idx_queue_added ON queue(added_at);
+    """
+    )
+    # Optional FTS5
+    try:
+        cur.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts
+            USING fts5(title, description, content='episodes', content_rowid='id');
+            """
+        )
+        cur.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
+              INSERT INTO episodes_fts(rowid, title, description)
+              VALUES (new.id, new.title, new.description);
+            END;
+            CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
+              INSERT INTO episodes_fts(episodes_fts, rowid, title, description)
+              VALUES('delete', old.id, old.title, old.description);
+            END;
+            CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
+              INSERT INTO episodes_fts(episodes_fts, rowid, title, description)
+              VALUES('delete', old.id, old.title, old.description);
+              INSERT INTO episodes_fts(rowid, title, description)
+              VALUES (new.id, new.title, new.description);
+            END;
+            """
+        )
+    except sqlite3.OperationalError:
+        # FTS5 not available on this SQLite build; ignore.
+        pass
+
+    conn.commit()
+    return conn
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+def slugify(text: str, maxlen: int = 120) -> str:
+    text = (text or "").strip().lower()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s-]+", "-", text).strip("-")
+    text = text[:maxlen] if text else "episode"
+    return text or "episode"
+
+def require_feed_exists(conn: sqlite3.Connection, short_name: str):
+    cur = conn.execute("SELECT 1 FROM feeds WHERE short_name = ?", (short_name,))
+    if not cur.fetchone():
+        raise SystemExit(
+            f"Feed '{short_name}' not found. Use 'add-feed' first or check 'list-feeds'."
+        )
+
+def human_size(n: Optional[int]) -> str:
+    if n is None:
+        return "?"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(n)
+    for u in units:
+        if size < 1024 or u == units[-1]:
+            return f"{size:.2f} {u}"
+        size /= 1024
+
+def _parse_dt(s: str) -> Optional[dt.datetime]:
+    try:
+        d = email.utils.parsedate_to_datetime(s)
+        if d and d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d
+    except Exception:
+        pass
+    try:
+        s2 = s.replace("Z", "+00:00")
+        d = dt.datetime.fromisoformat(s2)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d
+    except Exception:
+        return None
+
+def parse_date(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    d = _parse_dt(s.strip())
+    if d:
+        return d.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat()
+    # As a last resort, return the original (so we don't lose data)
+    return s.strip()
+
+def ago_str(iso: Optional[str]) -> str:
+    if not iso:
+        return ""
+    try:
+        d = _parse_dt(iso) or dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        delta = dt.datetime.now(dt.timezone.utc) - d.astimezone(dt.timezone.utc)
+        secs = int(delta.total_seconds())
+        if secs < 60: return f"{secs}s ago"
+        mins = secs // 60
+        if mins < 60: return f"{mins}m ago"
+        hrs = mins // 60
+        if hrs < 48: return f"{hrs}h ago"
+        days = hrs // 24
+        if days < 60: return f"{days}d ago"
+        months = days // 30
+        if months < 24: return f"{months}mo ago"
+        years = months // 12
+        return f"{years}y ago"
+    except Exception:
+        return ""
+
+# ---------- HTTP helpers ----------
+
+def http_get(url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[int, Dict[str, str], bytes]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            **(headers or {}),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            status = resp.status
+            hdrs = {k: v for k, v in resp.headers.items()}
+            body = resp.read()
+            return status, hdrs, body
+    except urllib.error.HTTPError as e:
+        # e.code present; for 304 Not Modified we return with no body
+        if e.code == 304:
+            return 304, dict(e.headers.items()), b""
+        raise
+
+def http_stream_to_file(url: str, out_path: str, max_retries: int = 3) -> Tuple[int, Optional[int]]:
+    tmp_path = out_path + ".part"
+    delay = 0.75
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}
+            )
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if ctype and not ("audio" in ctype or "octet-stream" in ctype):
+                    eprint(f"  Warning: unexpected content-type: {ctype}")
+                total = resp.headers.get("Content-Length")
+                total_i = int(total) if total and total.isdigit() else None
+                CHUNK = 1024 * 256
+                written = 0
+                start = time.time()
+                with open(tmp_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(CHUNK)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        written += len(chunk)
+                        if total_i:
+                            pct = written * 100 // total_i
+                            speed = written / max(1e-6, (time.time() - start))
+                            eprint(
+                                f"\r  {pct:3d}%  {human_size(written)} / {human_size(total_i)}  {human_size(int(speed))}/s",
+                                end="",
+                            )
+            os.replace(tmp_path, out_path)  # atomic
+            if total_i:
+                eprint("\r  100% " + " " * 40)
+            return written, total_i
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            if attempt >= max_retries:
+                raise
+            eprint(f"\n  Retry {attempt}/{max_retries} after error: {e}")
+            time.sleep(delay)
+            delay *= 2
+
+# ---------- RSS Parsing (RSS-only) ----------
+
+def text_of(elem: Optional[ET.Element]) -> Optional[str]:
+    if elem is None:
+        return None
+    return (elem.text or "").strip() or None
+
+def find_enclosure_rss(item: ET.Element) -> Optional[str]:
+    # <enclosure url="..."/>
+    enc = item.find("enclosure")
+    if enc is not None:
+        url = enc.get("url")
+        if url:
+            return url.strip()
+    # Fallback: media:content (namespaced)
+    for e in item.findall(".//{*}content"):
+        if e.get("url"):
+            t = (e.get("type") or "").lower()
+            if (
+                not t
+                or t.startswith("audio/")
+                or "mpeg" in t
+                or "mp3" in t
+                or "aac" in t
+                or "ogg" in t
+                or "opus" in t
+                or "m4a" in t
+            ):
+                return e.get("url").strip()
+    return None
+
+def parse_rss_item(it: ET.Element) -> Dict[str, Optional[str]]:
+    title = text_of(it.find("title"))
+    guid = text_of(it.find("guid")) or text_of(it.find("{*}id"))
+    link = text_of(it.find("link"))
+    desc = text_of(it.find("description")) or text_of(it.find("{*}summary"))
+    pub = text_of(it.find("pubDate")) or text_of(it.find("{*}date"))
+    enclosure = find_enclosure_rss(it)
+    return {
+        "guid": guid or (enclosure or title),
+        "title": title,
+        "pub_date": parse_date(pub),
+        "enclosure_url": enclosure,
+        "link": link,
+        "description": desc,
+    }
+
+def parse_feed_rss(xml_bytes: bytes) -> List[Dict[str, Optional[str]]]:
+    """
+    Strictly parse RSS feeds. Reject Atom (<feed>) and unknown roots.
+    Returns items with keys: guid, title, pub_date, enclosure_url, link, description.
+    """
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse feed XML: {e}")
+
+    tag = root.tag.lower()
+    # Accept <rss ...> (possibly namespaced) or <rdf:RDF> with channel/item, but REJECT <feed>
+    if tag.endswith("feed"):
+        raise SystemExit(
+            "This URL appears to be an Atom feed (<feed>). RSS is required. Please supply an RSS feed URL."
+        )
+    if not tag.endswith("rss") and "rdf" not in tag:
+        raise SystemExit(f"Unsupported feed format (root tag '{root.tag}'). RSS is required.")
+
+    channel = root.find("channel")
+    if channel is None:
+        # Try wildcard search (namespaced)
+        channel = root.find(".//channel")
+    if channel is None:
+        raise SystemExit("Invalid RSS: <channel> not found.")
+
+    items = []
+    for it in channel.findall("item"):
+        items.append(parse_rss_item(it))
+    if not items:
+        for it in channel.findall(".//item"):
+            items.append(parse_rss_item(it))
+
+    # Keep only meaningful items
+    items = [i for i in items if i.get("title") or i.get("enclosure_url") or i.get("guid")]
+    if not items:
+        eprint("Warning: RSS parsed but contained no <item> entries.")
+    return items
+
+# ---------- Feed conditional fetching ----------
+
+def _get_conditional_headers(conn: sqlite3.Connection, feed_short: str) -> Dict[str, str]:
+    row = conn.execute("SELECT etag, last_modified FROM feed_meta WHERE feed = ?", (feed_short,)).fetchone()
+    headers: Dict[str, str] = {}
+    if row:
+        if row["etag"]:
+            headers["If-None-Match"] = row["etag"]
+        if row["last_modified"]:
+            headers["If-Modified-Since"] = row["last_modified"]
+    return headers
+
+def _update_feed_meta(conn: sqlite3.Connection, feed_short: str, hdrs: Dict[str, str]):
+    etag = hdrs.get("ETag") or hdrs.get("Etag")
+    lastm = hdrs.get("Last-Modified") or hdrs.get("Last-modified")
+    conn.execute(
+        "INSERT INTO feed_meta(feed, etag, last_modified, updated_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(feed) DO UPDATE SET etag=excluded.etag, last_modified=excluded.last_modified, updated_at=excluded.updated_at",
+        (feed_short, etag, lastm, now_iso()),
+    )
+    conn.commit()
+
+# ---------- CLI Actions ----------
+
+def cmd_init(args):
+    ensure_dirs()
+    cfg = read_podfile()
+    write_podfile(cfg)
+    with connect_db() as conn:
+        pass
+    print(
+        f"Initialized:\n"
+        f"  Config:    {PODFILE_PATH}\n"
+        f"  Database:  {DB_PATH}\n"
+        f"  Downloads: {get_base_downloads_dir()}\n"
+        f"  YT dir:    {get_setting('download_yt_dir', DEFAULT_YT_DIR)}"
+    )
+
+def cmd_list_feeds(args):
+    cfg = read_podfile()
+    feeds = cfg["feeds"]
+    sums = cfg["summaries"]
+    if not feeds:
+        print("No feeds configured. Use 'add-feed' to add one (RSS only).")
+        return
+    print("Configured RSS feeds:")
+    for sn, url in feeds.items():
+        summ = (sums.get(sn) or "").strip()
+        summ = f" — {summ[:80]}{'…' if len(summ) > 80 else ''}" if summ else ""
+        print(f"  {sn}: {url}{summ}")
+
+def cmd_add_feed(args):
+    short = args.short_name
+    url = args.url
+    cfg = read_podfile()
+    if short in cfg["feeds"]:
+        raise SystemExit(f"Feed short name '{short}' already exists.")
+    cfg["feeds"][short] = url
+    write_podfile(cfg)
+    with connect_db() as conn:
+        now = now_iso()
+        conn.execute(
+            "INSERT OR REPLACE INTO feeds(short_name, url, custom_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (short, url, None, now, now),
+        )
+        conn.commit()
+    print(f"Added RSS feed '{short}': {url}")
+    print("Note: Feeds are validated as RSS during 'refresh'.")
+
+def cmd_remove_feed(args):
+    short = args.short_name
+    purge = args.purge_episodes
+    delete_files = args.delete_files
+    cfg = read_podfile()
+    if short not in cfg["feeds"]:
+        raise SystemExit(f"Feed '{short}' not found.")
+    url = cfg["feeds"].pop(short)
+    if cfg.has_section("summaries") and cfg["summaries"].get(short):
+        cfg["summaries"].pop(short, None)
+    write_podfile(cfg)
+    feed_dir = get_feed_download_dir(short)
+    with connect_db() as conn:
+        require_feed_exists(conn, short)
+        if purge:
+            conn.execute("DELETE FROM episodes WHERE feed = ?", (short,))
+            conn.execute("DELETE FROM downloads WHERE feed = ?", (short,))
+            conn.execute("DELETE FROM queue WHERE feed = ?", (short,))
+        conn.execute("DELETE FROM feeds WHERE short_name = ?", (short,))
+        conn.commit()
+    if delete_files and os.path.isdir(feed_dir):
+        shutil.rmtree(feed_dir, ignore_errors=True)
+    print(
+        f"Removed feed '{short}' ({url}).{' Purged episodes.' if purge else ''}{' Deleted files.' if delete_files else ''}"
+    )
+
+def cmd_rename_feed(args):
+    old = args.old_short
+    new = args.new_short
+    if old == new:
+        raise SystemExit("Old and new short names are the same.")
+    cfg = read_podfile()
+    if old not in cfg["feeds"]:
+        raise SystemExit(f"Feed '{old}' not found.")
+    if new in cfg["feeds"]:
+        raise SystemExit(f"Target short name '{new}' already exists.")
+    url = cfg["feeds"].pop(old)
+    cfg["feeds"][new] = url
+    if cfg.has_section("summaries"):
+        s = cfg["summaries"].pop(old, None)
+        if s is not None:
+            cfg["summaries"][new] = s
+    write_podfile(cfg)
+    with connect_db() as conn:
+        require_feed_exists(conn, old)
+        conn.execute(
+            "UPDATE feeds SET short_name = ?, updated_at = ? WHERE short_name = ?",
+            (new, now_iso(), old),
+        )
+        conn.execute("UPDATE episodes SET feed = ? WHERE feed = ?", (new, old))
+        conn.execute("UPDATE downloads SET feed = ? WHERE feed = ?", (new, old))
+        conn.execute("UPDATE queue SET feed = ? WHERE feed = ?", (new, old))
+        conn.execute("UPDATE feed_meta SET feed = ? WHERE feed = ?", (new, old))
+        conn.commit()
+
+    # Move per-feed override key if present (settings only)
+    old_key = _feed_dir_key(old)
+    new_key = _feed_dir_key(new)
+    cfg2 = read_podfile()
+    if cfg2["settings"].get(old_key) is not None:
+        val = cfg2["settings"].pop(old_key)
+        cfg2["settings"][new_key] = val
+        write_podfile(cfg2)
+
+    # Filesystem move logic if no override
+    has_override = read_podfile()["settings"].get(new_key) is not None
+    if not has_override:
+        old_dir = os.path.join(get_base_downloads_dir(), old)
+        new_dir = os.path.join(get_base_downloads_dir(), new)
+        if os.path.isdir(old_dir):
+            os.makedirs(os.path.dirname(new_dir), exist_ok=True)
+            os.replace(old_dir, new_dir)
+
+    print(f"Renamed feed '{old}' → '{new}'")
+
+def cmd_set_summary(args):
+    short = args.short_name
+    summ = args.summary
+    cfg = read_podfile()
+    if short not in cfg["feeds"]:
+        raise SystemExit(f"Feed '{short}' not found.")
+    cfg["summaries"][short] = summ
+    write_podfile(cfg)
+    print(f"Set summary for '{short}'.")
+
+def _fetch_feed_with_conditionals(conn: sqlite3.Connection, short: str, url: str) -> Optional[bytes]:
+    headers = _get_conditional_headers(conn, short)
+    try:
+        status, hdrs, body = http_get(url, headers=headers)
+        if status == 304:
+            print(f"  Not modified (ETag/Last-Modified).")
+            return None
+        _update_feed_meta(conn, short, hdrs)
+        return body
+    except Exception as e:
+        eprint(f"  Error fetching feed: {e}")
+        return None
+
+def cmd_refresh(args):
+    cfg = read_podfile()
+    if args.all:
+        targets = list(cfg["feeds"].keys())
+        if not targets:
+            raise SystemExit("No feeds configured.")
+    else:
+        if not args.feed:
+            raise SystemExit("Use --feed FEED or --all.")
+        if args.feed not in cfg["feeds"]:
+            raise SystemExit(f"Feed '{args.feed}' not found.")
+        targets = [args.feed]
+
+    with connect_db() as conn:
+        for short in targets:
+            url = cfg["feeds"][short]
+            print(f"[{short}] Fetching RSS: {url}")
+            xml = _fetch_feed_with_conditionals(conn, short, url)
+            if xml is None:
+                continue  # unchanged or fetch error already printed
+            try:
+                items = parse_feed_rss(xml)  # RSS-only enforcement
+            except SystemExit as se:
+                eprint(f"  Validation failed: {se}")
+                continue
+            print(f"  Parsed {len(items)} RSS item(s)")
+            added = 0
+            now = now_iso()
+            for it in items:
+                try:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO episodes(feed, guid, title, pub_date, enclosure_url, link, description, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            short,
+                            it.get("guid"),
+                            it.get("title"),
+                            it.get("pub_date"),
+                            it.get("enclosure_url"),
+                            it.get("link"),
+                            it.get("description"),
+                            now,
+                        ),
+                    )
+                    if conn.total_changes > 0:
+                        added += 1
+                except sqlite3.IntegrityError:
+                    pass
+            conn.execute(
+                "UPDATE feeds SET updated_at = ? WHERE short_name = ?",
+                (now_iso(), short),
+            )
+            conn.commit()
+            print(f"  Added {added} new episode record(s)")
+
+def cmd_info(args):
+    short = args.short_name
+    cfg = read_podfile()
+    if short not in cfg["feeds"]:
+        raise SystemExit(f"Feed '{short}' not found.")
+    url = cfg["feeds"][short]
+    summary = cfg["summaries"].get(short, "")
+    with connect_db() as conn:
+        c1 = conn.execute(
+            "SELECT COUNT(*) AS c FROM episodes WHERE feed = ?", (short,)
+        ).fetchone()["c"]
+        c2 = conn.execute(
+            "SELECT COUNT(*) AS c FROM downloads WHERE feed = ? AND status = 'completed'",
+            (short,),
+        ).fetchone()["c"]
+        last_pub = conn.execute(
+            """
+            SELECT pub_date FROM episodes
+            WHERE feed = ?
+            ORDER BY (pub_date IS NULL), pub_date DESC
+            LIMIT 1
+            """,
+            (short,),
+        ).fetchone()
+        last_pub_s = last_pub["pub_date"] if last_pub else "N/A"
+    ago = f" ({ago_str(last_pub_s)})" if last_pub_s and last_pub_s != "N/A" else ""
+    print(f"Feed:         {short}")
+    print(f"URL:          {url}")
+    print(f"Format:       RSS (enforced)")
+    print(f"Download dir: {get_feed_download_dir(short)}")
+    print(f"Episodes:     {c1}")
+    print(f"Downloaded:   {c2}")
+    print(f"Last publish: {last_pub_s}{ago}")
+    if summary:
+        print("\nSummary:")
+        print(textwrap.fill(summary, width=88))
+
+def cmd_clean(args):
+    short = args.short_name
+    delete_files = args.delete_files
+    with connect_db() as conn:
+        require_feed_exists(conn, short)
+        conn.execute("DELETE FROM downloads WHERE feed = ?", (short,))
+        conn.commit()
+    if delete_files:
+        d = get_feed_download_dir(short)
+        if os.path.isdir(d):
+            removed = 0
+            for root, dirs, files in os.walk(d):
+                for fn in files:
+                    p = os.path.join(root, fn)
+                    with contextlib.suppress(Exception):
+                        os.unlink(p)
+                        removed += 1
+            print(
+                f"Cleared download records for '{short}' and deleted {removed} files."
+            )
+            return
+    print(f"Cleared download records for '{short}'.")
+
+def _episodes_for_download(
+    conn: sqlite3.Connection,
+    feed: str,
+    latest: Optional[int],
+    all_flag: bool,
+    ids: Optional[List[int]],
+    since: Optional[str],
+) -> List[sqlite3.Row]:
+    base = (
+        "SELECT e.* FROM episodes e LEFT JOIN downloads d ON d.episode_id = e.id AND d.status = 'completed' WHERE e.feed = ? AND d.id IS NULL"
+    )
+    args = [feed]
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        base += f" AND e.id IN ({placeholders})"
+        args.extend(ids)
+    if since:
+        base += " AND (e.pub_date IS NOT NULL AND e.pub_date >= ?)"
+        args.append(since)
+    # Newest first; non-null pub_date first, then id desc
+    base += " ORDER BY (e.pub_date IS NULL), e.pub_date DESC, e.id DESC"
+    if latest and not all_flag and not ids:
+        base += f" LIMIT {int(latest)}"
+    return list(conn.execute(base, args))
+
+def _derive_filename(title: Optional[str], enclosure_url: Optional[str]) -> str:
+    base = slugify(title or "episode")
+    ext = ""
+    if enclosure_url:
+        path = urllib.parse.urlparse(enclosure_url).path
+        ext = os.path.splitext(path)[1]
+        if not ext and "." in path:
+            ext = "." + path.rsplit(".", 1)[-1]
+        if ext and len(ext) > 6:
+            ext = ""
+    if ext.lower() not in (".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".opus"):
+        ext = ext if ext else ".mp3"
+    return base + ext
+
+def _download_one(
+    conn: sqlite3.Connection, feed: str, row: sqlite3.Row, out_dir: str
+) -> Tuple[bool, Optional[str]]:
+    eid = row["id"]
+    title = row["title"]
+    enc = row["enclosure_url"]
+    if not enc:
+        eprint(f"  [id={eid}] Skipped: no enclosure URL in RSS item")
+        return False, None
+    fname = _derive_filename(title, enc)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, fname)
+    existing = conn.execute(
+        "SELECT 1 FROM downloads WHERE episode_id = ? AND status = 'completed'",
+        (eid,),
+    ).fetchone()
+    if existing and os.path.exists(out_path):
+        print(f"  [id={eid}] Already downloaded: {fname}")
+        return True, out_path
+    print(f"  [id={eid}] Downloading: {title or '(no title)'}")
+    try:
+        written, _ = http_stream_to_file(enc, out_path)
+        conn.execute(
+            "INSERT INTO downloads(episode_id, feed, file_path, status, size_bytes, downloaded_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (eid, feed, out_path, "completed", int(written), now_iso()),
+        )
+        conn.commit()
+        print(f"    Saved: {fname} ({human_size(written)})")
+        return True, out_path
+    except Exception as e:
+        eprint(f"    Failed: {e}")
+        with contextlib.suppress(Exception):
+            conn.execute(
+                "INSERT INTO downloads(episode_id, feed, file_path, status, size_bytes, downloaded_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (eid, feed, out_path, "failed", None, now_iso()),
+            )
+            conn.commit()
+        with contextlib.suppress(Exception):
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        return False, None
+
+def _parallel_map(func, rows: Iterable, jobs: int) -> List:
+    if jobs <= 1:
+        return [func(r) for r in rows]
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results: List = []
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        futs = [ex.submit(func, r) for r in rows]
+        for fut in as_completed(futs):
+            results.append(fut.result())
+    return results
+
+def cmd_download(args):
+    feed = args.feed
+    latest = args.latest
+    all_flag = args.all
+    ids = [int(x) for x in args.ids.split(",")] if args.ids else None
+    since = args.since
+    jobs = int(args.jobs or 1)
+    if not feed:
+        raise SystemExit("Use --feed FEED.")
+    with connect_db() as conn:
+        require_feed_exists(conn, feed)
+        rows = _episodes_for_download(conn, feed, latest, all_flag, ids, since)
+        if not rows:
+            print("Nothing to download.")
+            return
+    out_dir = get_feed_download_dir(feed)
+    ok = 0
+    if jobs <= 1:
+        with connect_db() as conn:
+            for r in rows:
+                success, _ = _download_one(conn, feed, r, out_dir)
+                ok += int(success)
+    else:
+        # Each worker uses its own connection
+        def work(r):
+            with connect_db() as c2:
+                return int(_download_one(c2, feed, r, out_dir)[0])
+        for res in _parallel_map(work, rows, jobs):
+            ok += int(res)
+    print(f"Downloaded {ok}/{len(rows)} episodes.")
+
+def cmd_download_title(args):
+    feed = args.feed
+    title_q = args.title.strip().lower()
+    if not (feed and title_q):
+        raise SystemExit("Use --feed FEED and --title 'text'.")
+    with connect_db() as conn:
+        require_feed_exists(conn, feed)
+        row = conn.execute(
+            """
+            SELECT * FROM episodes
+            WHERE feed = ? AND LOWER(title) LIKE ?
+            ORDER BY (pub_date IS NULL), pub_date DESC, id DESC
+            LIMIT 1
+            """,
+            (feed, f"%{title_q}%"),
+        ).fetchone()
+        if not row:
+            print("No matching episode found.")
+            return
+        out_dir = get_feed_download_dir(feed)
+        _download_one(conn, feed, row, out_dir)
+
+def _print_episode_list(rows: List[sqlite3.Row], show_feed: bool = False):
+    if not rows:
+        print("No episodes.")
+        return
+    for r in rows:
+        pd = r["pub_date"] or ""
+        title = r["title"] or "(no title)"
+        eid = r["id"]
+        if show_feed:
+            print(f"[{r['feed']}] id={eid}  {pd}  {title}")
+        else:
+            print(f"id={eid}  {pd}  {title}")
+
+def cmd_search(args):
+    feed = args.feed
+    query = (args.query or "").strip().lower()
+    if not (feed and query):
+        raise SystemExit("Use --feed FEED and --query 'text'.")
+    with connect_db() as conn:
+        require_feed_exists(conn, feed)
+        if args.fts:
+            rows = list(conn.execute(
+                """
+                SELECT e.*
+                FROM episodes_fts f
+                JOIN episodes e ON e.id = f.rowid
+                WHERE e.feed = ? AND episodes_fts MATCH ?
+                ORDER BY (e.pub_date IS NULL), e.pub_date DESC, e.id DESC
+                """, (feed, query)
+            ))
+        else:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT * FROM episodes
+                    WHERE feed = ? AND (LOWER(title) LIKE ? OR LOWER(description) LIKE ?)
+                    ORDER BY (pub_date IS NULL), pub_date DESC, id DESC
+                    """,
+                    (feed, f"%{query}%", f"%{query}%"),
+                )
+            )
+    _print_episode_list(rows)
+
+def cmd_search_all(args):
+    query = (args.query or "").strip().lower()
+    if not query:
+        raise SystemExit("Use --query 'text'.")
+    with connect_db() as conn:
+        if args.fts:
+            rows = list(conn.execute(
+                """
+                SELECT e.*
+                FROM episodes_fts f
+                JOIN episodes e ON e.id = f.rowid
+                WHERE episodes_fts MATCH ?
+                ORDER BY (e.pub_date IS NULL), e.pub_date DESC, e.id DESC
+                """, (query,)
+            ))
+        else:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT * FROM episodes
+                    WHERE (LOWER(title) LIKE ? OR LOWER(description) LIKE ?)
+                    ORDER BY (pub_date IS NULL), pub_date DESC, id DESC
+                    """,
+                    (f"%{query}%", f"%{query}%"),
+                )
+            )
+    _print_episode_list(rows, show_feed=True)
+
+def cmd_queue_add(args):
+    feed = args.feed
+    eid = args.episode_id
+    title_q = (args.title or "").strip().lower()
+    if not feed:
+        raise SystemExit("Use --feed FEED.")
+    if not (eid or title_q):
+        raise SystemExit("Provide --episode-id ID or --title 'text'.")
+    with connect_db() as conn:
+        require_feed_exists(conn, feed)
+        if eid:
+            row = conn.execute(
+                "SELECT * FROM episodes WHERE id = ? AND feed = ?", (eid, feed)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT * FROM episodes
+                WHERE feed = ? AND LOWER(title) LIKE ?
+                ORDER BY (pub_date IS NULL), pub_date DESC, id DESC
+                LIMIT 1
+                """,
+                (feed, f"%{title_q}%"),
+            ).fetchone()
+        if not row:
+            raise SystemExit("Episode not found.")
+        existing = conn.execute(
+            "SELECT 1 FROM queue WHERE episode_id = ?", (row["id"],)
+        ).fetchone()
+        if existing:
+            print(f"Already in queue: id={row['id']}  {row['title']}")
+            return
+        conn.execute(
+            "INSERT INTO queue(episode_id, feed, added_at) VALUES (?, ?, ?)",
+            (row["id"], feed, now_iso()),
+        )
+        conn.commit()
+        print(f"Queued: id={row['id']}  {row['title']}")
+
+def cmd_queue_list(args):
+    with connect_db() as conn:
+        rows = list(
+            conn.execute(
+                """
+        SELECT q.id as qid, e.id as eid, q.feed as feed, e.title as title, e.pub_date as pub_date
+        FROM queue q JOIN episodes e ON e.id = q.episode_id
+        ORDER BY q.added_at ASC
+        """
+            )
+        )
+    if not rows:
+        print("Queue is empty.")
+        return
+    for r in rows:
+        print(
+            f"queue_id={r['qid']}  [{r['feed']}] id={r['eid']}  {r['pub_date'] or ''}  {r['title'] or '(no title)'}"
+        )
+
+def cmd_queue_remove(args):
+    qid = args.queue_id
+    eid = args.episode_id
+    with connect_db() as conn:
+        if qid:
+            conn.execute("DELETE FROM queue WHERE id = ?", (qid,))
+        elif eid:
+            conn.execute("DELETE FROM queue WHERE episode_id = ?", (eid,))
+        else:
+            raise SystemExit("Use --queue-id QID or --episode-id ID.")
+        conn.commit()
+    print("Removed from queue.")
+
+def cmd_queue_reset(args):
+    with connect_db() as conn:
+        conn.execute("DELETE FROM queue")
+        conn.commit()
+    print("Queue cleared.")
+
+def cmd_queue_download(args):
+    jobs = int(args.jobs or 1)
+    with connect_db() as conn:
+        rows = list(
+            conn.execute(
+                """
+        SELECT q.id as qid, e.* FROM queue q JOIN episodes e ON e.id = q.episode_id ORDER BY q.added_at ASC
+        """
+            )
+        )
+        if not rows:
+            print("Queue is empty.")
+            return
+    per_feed_dirs: Dict[str, str] = {}
+    def path_for_feed(feed: str) -> str:
+        d = per_feed_dirs.get(feed)
+        if not d:
+            d = get_feed_download_dir(feed)
+            os.makedirs(d, exist_ok=True)
+            per_feed_dirs[feed] = d
+        return d
+    def work(r):
+        feed = r["feed"]
+        out_dir = path_for_feed(feed)
+        with connect_db() as c2:
+            success, _ = _download_one(c2, feed, r, out_dir)
+            # delete by queue id (qid)
+            c2.execute("DELETE FROM queue WHERE id = ?", (r["qid"],))
+            c2.commit()
+            return int(success)
+    ok = 0
+    for res in _parallel_map(work, rows, jobs):
+        ok += int(res)
+    print(f"Downloaded {ok}/{len(rows)} queued episodes.")
+
+def cmd_playlist(args):
+    args.playlist_func(args)
+
+def playlist_create(args):
+    name = args.name
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO playlists(name, created_at) VALUES (?, ?)",
+            (name, now_iso()),
+        )
+        conn.commit()
+    print(f"Playlist created: {name}")
+
+def playlist_list(args):
+    with connect_db() as conn:
+        rows = list(
+            conn.execute(
+                "SELECT name, created_at FROM playlists ORDER BY name ASC"
+            )
+        )
+    if not rows:
+        print("No playlists.")
+        return
+    for r in rows:
+        print(f"{r['name']}  (created {r['created_at']})")
+
+def playlist_add(args):
+    name = args.name
+    eid = args.episode_id
+    if not eid:
+        raise SystemExit("Provide --episode-id ID.")
+    with connect_db() as conn:
+        pl = conn.execute(
+            "SELECT 1 FROM playlists WHERE name = ?", (name,)
+        ).fetchone()
+        if not pl:
+            raise SystemExit(f"Playlist '{name}' not found. Create it first.")
+        ep = conn.execute(
+            "SELECT id FROM episodes WHERE id = ?", (eid,)
+        ).fetchone()
+        if not ep:
+            raise SystemExit("Episode not found.")
+        pos_row = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) AS p FROM playlist_items WHERE playlist_name = ?",
+            (name,),
+        ).fetchone()
+        pos = int(pos_row["p"]) + 1
+        conn.execute(
+            "INSERT OR REPLACE INTO playlist_items(playlist_name, episode_id, position, added_at) VALUES (?, ?, ?, ?)",
+            (name, eid, pos, now_iso()),
+        )
+        conn.commit()
+    print(f"Added episode {eid} to playlist '{name}' at position {pos}.")
+
+def playlist_remove(args):
+    name = args.name
+    eid = args.episode_id
+    with connect_db() as conn:
+        conn.execute(
+            "DELETE FROM playlist_items WHERE playlist_name = ? AND episode_id = ?",
+            (name, eid),
+        )
+        conn.commit()
+    print(f"Removed episode {eid} from playlist '{name}'.")
+
+def playlist_show(args):
+    name = args.name
+    with connect_db() as conn:
+        rows = list(
+            conn.execute(
+                """
+        SELECT pi.position as pos, e.id as eid, e.title as title, e.pub_date as pub_date, e.feed as feed
+        FROM playlist_items pi JOIN episodes e ON e.id = pi.episode_id
+        WHERE pi.playlist_name = ?
+        ORDER BY pi.position ASC
+        """,
+                (name,),
+            )
+        )
+    if not rows:
+        print(f"Playlist '{name}' is empty or does not exist.")
+        return
+    for r in rows:
+        print(
+            f"{r['pos']:>3d}. [{r['feed']}] id={r['eid']}  {r['pub_date'] or ''}  {r['title'] or '(no title)'}"
+        )
+
+def playlist_export(args):
+    name = args.name
+    out = os.path.expanduser(args.out)
+    with connect_db() as conn:
+        rows = list(
+            conn.execute(
+                """
+        SELECT d.file_path FROM playlist_items pi
+        JOIN episodes e ON e.id = pi.episode_id
+        JOIN downloads d ON d.episode_id = e.id AND d.status = 'completed'
+        WHERE pi.playlist_name = ?
+        ORDER BY pi.position ASC
+        """,
+                (name,),
+            )
+        )
+    if not rows:
+        raise SystemExit("Nothing to export. Ensure episodes are downloaded.")
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("#EXTM3U\n")
+        for r in rows:
+            f.write(os.path.abspath(r["file_path"]) + "\n")
+    print(f"Exported playlist '{name}' to {out}")
+
+# ---------- OPML import/export ----------
+
+def _unique_short_name(base: str, existing: Iterable[str]) -> str:
+    base = slugify(base, maxlen=40) or "feed"
+    if base not in existing:
+        return base
+    i = 2
+    while f"{base}{i}" in existing:
+        i += 1
+    return f"{base}{i}"
+
+def cmd_opml_import(args):
+    path = os.path.expanduser(args.path)
+    if not os.path.isfile(path):
+        raise SystemExit(f"OPML file not found: {path}")
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse OPML: {e}")
+    outlines = root.findall(".//outline")
+    found = []
+    for o in outlines:
+        url = o.attrib.get("xmlUrl") or o.attrib.get("xmlurl") or ""
+        text = o.attrib.get("title") or o.attrib.get("text") or url
+        if url:
+            found.append((text, url))
+    if not found:
+        print("No feeds found in OPML.")
+        return
+    cfg = read_podfile()
+    existing = set(cfg["feeds"].keys())
+    added = 0
+    with connect_db() as conn:
+        now = now_iso()
+        for title, url in found:
+            short = _unique_short_name(title or url, existing)
+            existing.add(short)
+            cfg["feeds"][short] = url
+            conn.execute(
+                "INSERT OR REPLACE INTO feeds(short_name, url, custom_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (short, url, title, now, now),
+            )
+            added += 1
+        write_podfile(cfg)
+        conn.commit()
+    print(f"Imported {added} feed(s) from {path}.")
+
+def cmd_opml_export(args):
+    path = os.path.expanduser(args.path)
+    cfg = read_podfile()
+    feeds = cfg["feeds"]
+    if not feeds:
+        raise SystemExit("No feeds to export.")
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    root = ET.Element("opml", version="2.0")
+    head = ET.SubElement(root, "head")
+    ET.SubElement(head, "title").text = f"{APP_NAME} Feeds"
+    body = ET.SubElement(root, "body")
+    for short, url in sorted(feeds.items()):
+        summ = cfg["summaries"].get(short) or short
+        ET.SubElement(body, "outline", type="rss", text=summ, title=summ, xmlUrl=url)
+    tree = ET.ElementTree(root)
+    tree.write(path, encoding="utf-8", xml_declaration=True)
+    print(f"Exported {len(feeds)} feed(s) to {path}.")
+
+# ---------- yt-dlp helpers ----------
+
+def run_yt_dlp(link: str, video: bool, out_dir: str):
+    """Invoke yt-dlp to download a link as audio (default) or video.
+    Requires `yt-dlp` to be available on PATH. Raises on failure.
+    """
+    out_dir = os.path.expanduser(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    # filename template: title + id to avoid collisions
+    template = os.path.join(out_dir, "%(title).120s-%(id)s.%(ext)s")
+
+    if video:
+        args = [
+            "yt-dlp",
+            "-f",
+            "bestvideo*+bestaudio/best",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            template,
+            link,
+        ]
+    else:
+        args = [
+            "yt-dlp",
+            "-x",
+            "--audio-format",
+            "mp3",
+            "--audio-quality",
+            "0",
+            "-o",
+            template,
+            link,
+        ]
+    try:
+        eprint("Running:", " ".join(args))
+        subprocess.check_call(args)
+    except FileNotFoundError:
+        raise SystemExit(
+            "yt-dlp not found. Install it, e.g. `pipx install yt-dlp` or your package manager."
+        )
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(f"yt-dlp failed with exit code {e.returncode}.")
+
+def cmd_download_yt(args):
+    link = args.link
+    if not link:
+        raise SystemExit("Provide --link URL")
+    out_dir = get_setting("download_yt_dir", DEFAULT_YT_DIR)
+    run_yt_dlp(link=link, video=args.video, out_dir=out_dir)
+    print(
+        f"Saved to {os.path.abspath(os.path.expanduser(out_dir))} (mode: {'video' if args.video else 'audio-only'})"
+    )
+
+# ---------- Argument Parser ----------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description=DESC,
+    )
+
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # init
+    p = sub.add_parser("init", help="Initialize config directory and PodFile")
+    p.set_defaults(func=cmd_init)
+
+    # list-feeds
+    p = sub.add_parser("list-feeds", help="List all configured podcast feeds (RSS only)")
+    p.set_defaults(func=cmd_list_feeds)
+
+    # add-feed
+    p = sub.add_parser("add-feed", help="Add a new podcast feed (RSS URL)")
+    p.add_argument("short_name", help="Short name to refer to this feed")
+    p.add_argument("url", help="RSS URL (Atom will be rejected on refresh)")
+    p.set_defaults(func=cmd_add_feed)
+
+    # remove-feed
+    p = sub.add_parser("remove-feed", help="Remove a podcast feed")
+    p.add_argument("short_name", help="Short name of the feed to remove")
+    p.add_argument(
+        "--purge-episodes",
+        action="store_true",
+        help="Also delete manifest entries for this feed",
+    )
+    p.add_argument(
+        "--delete-files",
+        action="store_true",
+        help="Also delete downloaded files on disk",
+    )
+    p.set_defaults(func=cmd_remove_feed)
+
+    # rename-feed
+    p = sub.add_parser("rename-feed", help="Rename a podcast feed's short name")
+    p.add_argument("old_short", help="Existing short name")
+    p.add_argument("new_short", help="New short name")
+    p.set_defaults(func=cmd_rename_feed)
+
+    # refresh
+    p = sub.add_parser(
+        "refresh", help="Refresh episode list for a podcast (RSS validation enforced)"
+    )
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--feed", help="Short name of the feed to refresh")
+    g.add_argument("--all", action="store_true", help="Refresh all feeds")
+    p.set_defaults(func=cmd_refresh)
+
+    # info
+    p = sub.add_parser("info", help="Show detailed info about a podcast")
+    p.add_argument("short_name", help="Feed short name")
+    p.set_defaults(func=cmd_info)
+
+    # set-summary
+    p = sub.add_parser("set-summary", help="Set a custom podcast summary")
+    p.add_argument("short_name", help="Feed short name")
+    p.add_argument("summary", help="Summary text")
+    p.set_defaults(func=cmd_set_summary)
+
+    # clean
+    p = sub.add_parser(
+        "clean", help="Clear all download records for a podcast"
+    )
+    p.add_argument("short_name", help="Feed short name")
+    p.add_argument(
+        "--delete-files",
+        action="store_true",
+        help="Also remove downloaded files from disk",
+    )
+    p.set_defaults(func=cmd_clean)
+
+    # download
+    p = sub.add_parser("download", help="Download episodes from a feed")
+    p.add_argument("--feed", required=True, help="Feed short name")
+    p.add_argument(
+        "-L",
+        "--latest",
+        type=int,
+        default=1,
+        help="Download latest N not-yet-downloaded episodes (default: 1)",
+    )
+    p.add_argument("--all", action="store_true", help="Download all not-yet-downloaded episodes")
+    p.add_argument("--ids", help="Comma-separated episode IDs to download")
+    p.add_argument(
+        "--since", help="Only episodes with pub_date >= ISO date (e.g., 2024-01-01)"
+    )
+    p.add_argument(
+        "--jobs", type=int, default=1, help="Parallel downloads (default: 1)"
+    )
+    p.set_defaults(func=cmd_download)
+
+    # download-title
+    p = sub.add_parser("download-title", help="Download a specific episode by title")
+    p.add_argument("--feed", required=True, help="Feed short name")
+    p.add_argument("--title", required=True, help="Case-insensitive substring to match")
+    p.set_defaults(func=cmd_download_title)
+
+    # search
+    p = sub.add_parser("search", help="Search for episodes in a single podcast")
+    p.add_argument("--feed", required=True, help="Feed short name")
+    p.add_argument("--query", required=True, help="Text to search in title/description")
+    p.add_argument("--fts", action="store_true", help="Use FTS5 full-text search if available")
+    p.set_defaults(func=cmd_search)
+
+    # search-all
+    p = sub.add_parser(
+        "search-all", help="Search for text across all episodes of all podcasts"
+    )
+    p.add_argument("--query", required=True, help="Text to search in title/description")
+    p.add_argument("--fts", action="store_true", help="Use FTS5 full-text search if available")
+    p.set_defaults(func=cmd_search_all)
+
+    # queue-add
+    p = sub.add_parser("queue-add", help="Add an episode to the download queue")
+    p.add_argument("--feed", required=True, help="Feed short name")
+    p.add_argument("--episode-id", type=int, help="Episode ID")
+    p.add_argument("--title", help="Case-insensitive substring to match")
+    p.set_defaults(func=cmd_queue_add)
+
+    # queue-list
+    p = sub.add_parser("queue-list", help="List all episodes in the download queue")
+    p.set_defaults(func=cmd_queue_list)
+
+    # queue-download
+    p = sub.add_parser(
+        "queue-download", help="Download all episodes in the queue and clear it"
+    )
+    p.add_argument(
+        "--jobs", type=int, default=1, help="Parallel downloads (default: 1)"
+    )
+    p.set_defaults(func=cmd_queue_download)
+
+    # queue-remove
+    p = sub.add_parser("queue-remove", help="Remove an episode from the queue")
+    p.add_argument("--queue-id", type=int, help="Queue entry id")
+    p.add_argument("--episode-id", type=int, help="Episode id")
+    p.set_defaults(func=cmd_queue_remove)
+
+    # queue-reset
+    p = sub.add_parser("queue-reset", help="Clear the download queue completely")
+    p.set_defaults(func=cmd_queue_reset)
+
+    # playlist
+    p = sub.add_parser("playlist", help="Manage playlists of downloaded episodes")
+    pl_sub = p.add_subparsers(dest="playlist_cmd", required=True)
+
+    p1 = pl_sub.add_parser("create", help="Create a new playlist")
+    p1.add_argument("name")
+    p1.set_defaults(playlist_func=playlist_create)
+
+    p2 = pl_sub.add_parser("list", help="List playlists")
+    p2.set_defaults(playlist_func=playlist_list)
+
+    p3 = pl_sub.add_parser("add", help="Add an episode to a playlist")
+    p3.add_argument("name")
+    p3.add_argument("--episode-id", type=int, required=True)
+    p3.set_defaults(playlist_func=playlist_add)
+
+    p4 = pl_sub.add_parser("remove", help="Remove an episode from a playlist")
+    p4.add_argument("name")
+    p4.add_argument("--episode-id", type=int, required=True)
+    p4.set_defaults(playlist_func=playlist_remove)
+
+    p5 = pl_sub.add_parser("show", help="Show playlist items")
+    p5.add_argument("name")
+    p5.set_defaults(playlist_func=playlist_show)
+
+    p6 = pl_sub.add_parser("export", help="Export playlist as M3U")
+    p6.add_argument("name")
+    p6.add_argument("--out", required=True, help="Output .m3u path")
+    p6.set_defaults(playlist_func=playlist_export)
+
+    # settings
+    p = sub.add_parser("set", help="Set configuration values")
+    p.add_argument(
+        "--download-dir",
+        help="Base directory for podcast audio downloads (default layout base/<feed>)",
+    )
+    p.add_argument(
+        "--download-yt-dir",
+        help="Directory for yt-dlp downloads (audio/video)",
+    )
+    p.add_argument(
+        "--change-feed-dir",
+        dest="change_feed_dir",
+        help="Feed short name to set a custom download directory for",
+    )
+    p.add_argument(
+        "--dir",
+        dest="feed_dir_path",
+        help="Directory to use with --change-feed-dir",
+    )
+    p.add_argument(
+        "--unset-feed-dir",
+        dest="unset_feed_dir",
+        help="Feed short name to remove custom directory override",
+    )
+    p.add_argument(
+        "--show",
+        action="store_true",
+        help="Show current directory settings and overrides",
+    )
+    p.set_defaults(func=cmd_set)
+
+    # yt-dlp download
+    p = sub.add_parser(
+        "download-yt",
+        help="Download a link with yt-dlp (default audio-only).",
+    )
+    p.add_argument("--link", required=True, help="YouTube/yt-dlp-supported URL")
+    p.add_argument(
+        "--video",
+        action="store_true",
+        help="Download full video instead of extracting audio",
+    )
+    p.set_defaults(func=cmd_download_yt)
+
+    # OPML import/export
+    p = sub.add_parser("opml", help="Import/export feeds as OPML")
+    opml_sub = p.add_subparsers(dest="opml_cmd", required=True)
+
+    pi = opml_sub.add_parser("import", help="Import feeds from OPML file")
+    pi.add_argument("path", help="Path to OPML file")
+    pi.set_defaults(func=cmd_opml_import)
+
+    pe = opml_sub.add_parser("export", help="Export feeds to OPML file")
+    pe.add_argument("path", help="Path to write OPML file")
+    pe.set_defaults(func=cmd_opml_export)
+
+    return parser
+
+# --- settings ---
+
+def cmd_set(args):
+    made_change = False
+
+    if args.download_dir:
+        set_setting("download_dir", args.download_dir)
+        made_change = True
+
+    if args.download_yt_dir:
+        set_setting("download_yt_dir", args.download_yt_dir)
+        made_change = True
+
+    if args.change_feed_dir:
+        if not args.feed_dir_path:
+            raise SystemExit("Use --dir PATH with --change-feed-dir FEED")
+        set_feed_download_dir(args.change_feed_dir, args.feed_dir_path)
+        made_change = True
+        print(f"Set custom dir for feed '{args.change_feed_dir}' → {os.path.abspath(os.path.expanduser(args.feed_dir_path))}")
+
+    if args.unset_feed_dir:
+        unset_feed_download_dir(args.unset_feed_dir)
+        made_change = True
+        print(f"Removed custom dir override for feed '{args.unset_feed_dir}'")
+
+    if args.show or not made_change:
+        base = get_base_downloads_dir()
+        yt = get_setting("download_yt_dir", DEFAULT_YT_DIR)
+        print("Current settings:")
+        print(f"  Base download dir: {os.path.abspath(base)}")
+        print(f"  YT download dir:   {os.path.abspath(os.path.expanduser(yt))}")
+        overrides = list_feed_dir_overrides()
+        if overrides:
+            print("  Per-feed overrides:")
+            for feed, path in sorted(overrides.items()):
+                print(f"    {feed}: {os.path.abspath(path)}")
+        else:
+            print("  Per-feed overrides: (none)")
+
+    ensure_dirs()
+    if made_change and not args.show:
+        print("Settings updated.")
+
+# ---------- Main ----------
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        # opml combined subparser dispatch
+        if getattr(args, "opml_cmd", None):
+            args.func(args)
+        else:
+            args.func(args)
+    except KeyboardInterrupt:
+        eprint("Interrupted.")
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as e:
+        eprint(f"Error: {e}")
+        if os.environ.get("PODCAST_DEBUG"):
+            traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
