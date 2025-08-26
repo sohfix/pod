@@ -298,38 +298,55 @@ def choose_encode_args(cbr: Optional[str], mono: bool) -> List[str]:
 
 def find_player() -> Optional[List[str]]:
     """
-    Returns a command list for a suitable audio player (blocking preferred).
-    Tries: ffplay -autoexit, afplay (macOS), mpg123, cvlc, play (sox), powershell fallback.
+    Return a command list for a suitable audio player.
+    IMPORTANT: Do NOT reuse ffmpeg flags here. Players have different CLIs.
     """
+    # Prefer ffplay if available (auto-exit, no window, quiet)
     if shutil.which("ffplay"):
-        return ["ffplay", *ffmpeg_base_args(), "-autoexit"]
+        return ["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet"]
+
+    # macOS
     if platform.system() == "Darwin" and shutil.which("afplay"):
         return ["afplay"]
+
+    # Cross-platform fallbacks
     if shutil.which("mpg123"):
         return ["mpg123", "-q"]
     if shutil.which("cvlc"):
         return ["cvlc", "--play-and-exit", "--quiet"]
-    if shutil.which("play"):
+    if shutil.which("play"):  # sox
         return ["play", "-q"]
+
+    # Windows non-blocking fallback
     if platform.system() == "Windows":
         return ["cmd", "/c", "start", ""]
+
     return None
 
+
 def play_file(path: Path) -> None:
+    """
+    Play an audio file with a best-effort player command.
+    Never pass global ffmpeg flags (-y, -loglevel, etc.) into the player.
+    """
     if DRY_RUN:
         print(f"DRY-RUN>> play {path}")
         return
+
     cmd = find_player()
     if not cmd:
         print(f"note: no suitable audio player found to play {path}", file=sys.stderr)
         return
+
+    # Windows 'start' is non-blocking; everything else is fine as-is.
     run_subprocess(cmd + [str(path)])
+
 
 # ---------- Cutting & parsing ----------
 
 def make_atomic_target(target: Path) -> Tuple[Path, Path]:
-    """Return (.part path, final target). Caller must rename on success."""
-    tmp = target.with_suffix(target.suffix + ".part")
+    """Return (.part path, final target). Place .part before the extension so ffmpeg can infer format."""
+    tmp = target.with_name(f"{target.stem}.part{target.suffix}")
     return tmp, target
 
 def build_trim_silence_filter(enable: bool, thr: float, min_dur: float) -> Optional[str]:
@@ -708,14 +725,43 @@ def cmd_run(args):
         if len(inputs) != 1:
             print("error: single-clip mode requires exactly one -i/--input", file=sys.stderr)
             sys.exit(2)
+    
         input_mp3 = inputs[0]
         start_s = parse_time(args.start) - max(0.0, args.pad_start or 0.0)
-        end_s = parse_time(args.end) + max(0.0, args.pad_end or 0.0)
-
+        end_s   = parse_time(args.end)   + max(0.0, args.pad_end or 0.0)
+        if end_s <= start_s:
+            print("error: end must be greater than start", file=sys.stderr)
+            sys.exit(2)
+        dur = end_s - start_s
+    
+        # NEW: play-only audition (no file written)
+        if getattr(args, "play_only", False):
+            # Prefer ffplay (supports -ss/-t cleanly)
+            if shutil.which("ffplay"):
+                cmd = ["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet",
+                       "-ss", f"{start_s:.3f}", "-t", f"{dur:.3f}", str(input_mp3)]
+                rc = run_subprocess(cmd); sys.exit(rc if rc != 0 else 0)
+    
+            # VLC
+            if shutil.which("cvlc"):
+                cmd = ["cvlc", "--play-and-exit", "--quiet",
+                       f"--start-time={start_s:.3f}", f"--run-time={dur:.3f}", str(input_mp3)]
+                rc = run_subprocess(cmd); sys.exit(rc if rc != 0 else 0)
+    
+            # SoX 'play' supports time trimming: play input trim START DURATION
+            if shutil.which("play"):
+                cmd = ["play", "-q", str(input_mp3), "trim", f"{start_s:.3f}", f"{dur:.3f}"]
+                rc = run_subprocess(cmd); sys.exit(rc if rc != 0 else 0)
+    
+            print("error: no suitable player found for --play-only (need ffplay, cvlc, or SoX 'play')",
+                  file=sys.stderr)
+            sys.exit(2)
+    
+        # Normal write-to-disk path
         base_name = args.name or f"{input_mp3.stem}_{int(start_s)}-{int(end_s)}"
         clip_name = normalize_name(base_name) if args.normalize_names else sanitize_filename(base_name)
         out_path = outdir / f"{clip_name}.mp3"
-
+    
         copy = args.copy and args.edge_fade <= 0 and not args.mono and not args.cbr and not args.trim_silence
         run_ffmpeg_cut(
             input_mp3,
@@ -741,6 +787,7 @@ def cmd_run(args):
             final_name = out_path.with_name((args.prefix or "") + out_path.stem + (args.suffix or "") + out_path.suffix)
             play_file(final_name)
         return
+    
 
     # PARTS-ONLY CONCAT
     if args.parts:
@@ -1389,6 +1436,8 @@ def make_parser() -> argparse.ArgumentParser:
     )
     pr.add_argument("-h", "--help", action="help", help="Show help for 'run' and exit")
     pr.add_argument("--examples", action="store_true", help="Show 'run' examples and exit")
+    pr.add_argument("--play-only", action="store_true",
+                help="Play the requested start/end region without writing a file")
 
     # IO
     pr.add_argument("-i", "--input", metavar="FILE", action="append",
@@ -1634,11 +1683,16 @@ def main(argv=None):
     if "--examples" in argv and (len(argv) == 1 or argv[0] != "help"):
         print_examples_and_exit()
 
-    # Convenience: if first token isn't a subcommand, treat as 'run'
-    if argv and argv[0] not in {
-        "run","set","help","space","cut","batch","join","ez","knob","gen-completion",
+    # Convenience: if first non-global token isn't a subcommand, treat as 'run'
+    global_opts = {"-y", "--yes", "-v", "--verbose", "--progress", "--dry-run", "--examples", "--version", "-h", "--help"}
+    idx = 0
+    while idx < len(argv) and argv[idx] in global_opts:
+        idx += 1
+    if idx < len(argv) and argv[idx] not in {
+        "run", "set", "help", "space", "cut", "batch", "join", "ez", "knob", "gen-completion",
     }:
-        argv = ["run"] + argv
+        argv = argv[:idx] + ["run"] + argv[idx:]
+
 
     args = parser.parse_args(argv)
 
