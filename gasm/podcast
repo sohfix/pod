@@ -26,6 +26,7 @@ DATA_VERSION = "00001"
 APP_NAME = "podcast"
 DESC = "RSS-first podcast fetcher/downloader with queues & playlists"
 
+
 def xdg_path(env_key: str, default_sub: str) -> str:
     """
     Return a base path using XDG environment variable if set,
@@ -37,6 +38,7 @@ def xdg_path(env_key: str, default_sub: str) -> str:
     home = os.path.expanduser("~")
     return os.path.join(home, default_sub, APP_NAME)
 
+
 # Config & data directories
 CONFIG_DIR = xdg_path("XDG_CONFIG_HOME", "apps/.app-data/.config-files/podcast")
 DATA_DIR = xdg_path("XDG_DATA_HOME", "apps/pod/data/rnddata")
@@ -45,7 +47,9 @@ DB_PATH = os.path.join(DATA_DIR, f"{APP_NAME}-dv{DATA_VERSION}.db")
 PODFILE_PATH = os.path.join(CONFIG_DIR, "PODFILE.ini")
 
 # Default audio downloads go here (can be overridden by "download_dir" setting)
-DOWNLOADS_DIR = os.path.join(xdg_path("XDG_MUSIC_DIR", "media/audio/default/default-podcast"))
+DOWNLOADS_DIR = os.path.join(
+    xdg_path("XDG_MUSIC_DIR", "media/audio/default/default-podcast")
+)
 
 # Default yt-dlp downloads dir (can be overridden by `podcast set --download-yt-dir`)
 DEFAULT_YT_DIR = xdg_path("XDG_VIDEOS_DIR", "media/yt")
@@ -61,8 +65,10 @@ SQL_PRAGMAS = [
 
 # ---------- Utilities ----------
 
+
 def eprint(*a, **k):
     print(*a, file=sys.stderr, **k)
+
 
 def read_podfile() -> configparser.ConfigParser:
     ensure_minimal_dirs_only()
@@ -83,14 +89,17 @@ def read_podfile() -> configparser.ConfigParser:
         cfg["settings"] = {}
     return cfg
 
+
 def write_podfile(cfg: configparser.ConfigParser):
     ensure_minimal_dirs_only()
     with open(PODFILE_PATH, "w", encoding="utf-8") as f:
         cfg.write(f)
 
+
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
     cfg = read_podfile()
     return cfg.get("settings", key, fallback=default)
+
 
 def set_setting(key: str, value: Optional[str]):
     cfg = read_podfile()
@@ -102,18 +111,23 @@ def set_setting(key: str, value: Optional[str]):
         cfg["settings"][key] = os.path.expanduser(value)
     write_podfile(cfg)
 
+
 def ensure_minimal_dirs_only():
     # Ensure config & data dirs exist before reading/writing PodFile / DB
     os.makedirs(CONFIG_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
 
+
 # ---- Directory settings helpers ----
+
 
 def get_base_downloads_dir() -> str:
     return os.path.expanduser(get_setting("download_dir", DOWNLOADS_DIR))
 
+
 def _feed_dir_key(feed: str) -> str:
     return f"feed_dir.{feed}"
+
 
 def get_feed_download_dir(feed: str) -> str:
     override = get_setting(_feed_dir_key(feed))
@@ -121,11 +135,14 @@ def get_feed_download_dir(feed: str) -> str:
         return os.path.expanduser(override)
     return os.path.join(get_base_downloads_dir(), feed)
 
+
 def set_feed_download_dir(feed: str, path: str):
     set_setting(_feed_dir_key(feed), path)
 
+
 def unset_feed_download_dir(feed: str):
     set_setting(_feed_dir_key(feed), None)
+
 
 def list_feed_dir_overrides() -> Dict[str, str]:
     cfg = read_podfile()
@@ -135,6 +152,7 @@ def list_feed_dir_overrides() -> Dict[str, str]:
         if k.startswith("feed_dir."):
             out[k.split(".", 1)[1]] = os.path.expanduser(v)
     return out
+
 
 def ensure_dirs():
     # Config/data dirs
@@ -154,6 +172,7 @@ def ensure_dirs():
     yt_dir = get_setting("download_yt_dir", DEFAULT_YT_DIR)
     if yt_dir:
         os.makedirs(os.path.expanduser(yt_dir), exist_ok=True)
+
 
 def connect_db():
     ensure_dirs()
@@ -270,8 +289,10 @@ def connect_db():
     conn.commit()
     return conn
 
+
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
 
 def slugify(text: str, maxlen: int = 120) -> str:
     text = (text or "").strip().lower()
@@ -280,12 +301,14 @@ def slugify(text: str, maxlen: int = 120) -> str:
     text = text[:maxlen] if text else "episode"
     return text or "episode"
 
+
 def require_feed_exists(conn: sqlite3.Connection, short_name: str):
     cur = conn.execute("SELECT 1 FROM feeds WHERE short_name = ?", (short_name,))
     if not cur.fetchone():
         raise SystemExit(
             f"Feed '{short_name}' not found. Use 'add-feed' first or check 'list-feeds'."
         )
+
 
 def human_size(n: Optional[int]) -> str:
     if n is None:
@@ -296,6 +319,7 @@ def human_size(n: Optional[int]) -> str:
         if size < 1024 or u == units[-1]:
             return f"{size:.2f} {u}"
         size /= 1024
+
 
 def _parse_dt(s: str) -> Optional[dt.datetime]:
     try:
@@ -314,6 +338,7 @@ def _parse_dt(s: str) -> Optional[dt.datetime]:
     except Exception:
         return None
 
+
 def parse_date(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
@@ -323,6 +348,7 @@ def parse_date(s: Optional[str]) -> Optional[str]:
     # As a last resort, return the original (so we don't lose data)
     return s.strip()
 
+
 def ago_str(iso: Optional[str]) -> str:
     if not iso:
         return ""
@@ -330,23 +356,32 @@ def ago_str(iso: Optional[str]) -> str:
         d = _parse_dt(iso) or dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
         delta = dt.datetime.now(dt.timezone.utc) - d.astimezone(dt.timezone.utc)
         secs = int(delta.total_seconds())
-        if secs < 60: return f"{secs}s ago"
+        if secs < 60:
+            return f"{secs}s ago"
         mins = secs // 60
-        if mins < 60: return f"{mins}m ago"
+        if mins < 60:
+            return f"{mins}m ago"
         hrs = mins // 60
-        if hrs < 48: return f"{hrs}h ago"
+        if hrs < 48:
+            return f"{hrs}h ago"
         days = hrs // 24
-        if days < 60: return f"{days}d ago"
+        if days < 60:
+            return f"{days}d ago"
         months = days // 30
-        if months < 24: return f"{months}mo ago"
+        if months < 24:
+            return f"{months}mo ago"
         years = months // 12
         return f"{years}y ago"
     except Exception:
         return ""
 
+
 # ---------- HTTP helpers ----------
 
-def http_get(url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[int, Dict[str, str], bytes]:
+
+def http_get(
+    url: str, headers: Optional[Dict[str, str]] = None
+) -> Tuple[int, Dict[str, str], bytes]:
     req = urllib.request.Request(
         url,
         headers={
@@ -367,7 +402,10 @@ def http_get(url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[int, D
             return 304, dict(e.headers.items()), b""
         raise
 
-def http_stream_to_file(url: str, out_path: str, max_retries: int = 3) -> Tuple[int, Optional[int]]:
+
+def http_stream_to_file(
+    url: str, out_path: str, max_retries: int = 3
+) -> Tuple[int, Optional[int]]:
     tmp_path = out_path + ".part"
     delay = 0.75
     for attempt in range(1, max_retries + 1):
@@ -412,12 +450,15 @@ def http_stream_to_file(url: str, out_path: str, max_retries: int = 3) -> Tuple[
             time.sleep(delay)
             delay *= 2
 
+
 # ---------- RSS Parsing (RSS-only) ----------
+
 
 def text_of(elem: Optional[ET.Element]) -> Optional[str]:
     if elem is None:
         return None
     return (elem.text or "").strip() or None
+
 
 def find_enclosure_rss(item: ET.Element) -> Optional[str]:
     # <enclosure url="..."/>
@@ -443,6 +484,7 @@ def find_enclosure_rss(item: ET.Element) -> Optional[str]:
                 return e.get("url").strip()
     return None
 
+
 def parse_rss_item(it: ET.Element) -> Dict[str, Optional[str]]:
     title = text_of(it.find("title"))
     guid = text_of(it.find("guid")) or text_of(it.find("{*}id"))
@@ -458,6 +500,7 @@ def parse_rss_item(it: ET.Element) -> Dict[str, Optional[str]]:
         "link": link,
         "description": desc,
     }
+
 
 def parse_feed_rss(xml_bytes: bytes) -> List[Dict[str, Optional[str]]]:
     """
@@ -476,7 +519,9 @@ def parse_feed_rss(xml_bytes: bytes) -> List[Dict[str, Optional[str]]]:
             "This URL appears to be an Atom feed (<feed>). RSS is required. Please supply an RSS feed URL."
         )
     if not tag.endswith("rss") and "rdf" not in tag:
-        raise SystemExit(f"Unsupported feed format (root tag '{root.tag}'). RSS is required.")
+        raise SystemExit(
+            f"Unsupported feed format (root tag '{root.tag}'). RSS is required."
+        )
 
     channel = root.find("channel")
     if channel is None:
@@ -493,15 +538,23 @@ def parse_feed_rss(xml_bytes: bytes) -> List[Dict[str, Optional[str]]]:
             items.append(parse_rss_item(it))
 
     # Keep only meaningful items
-    items = [i for i in items if i.get("title") or i.get("enclosure_url") or i.get("guid")]
+    items = [
+        i for i in items if i.get("title") or i.get("enclosure_url") or i.get("guid")
+    ]
     if not items:
         eprint("Warning: RSS parsed but contained no <item> entries.")
     return items
 
+
 # ---------- Feed conditional fetching ----------
 
-def _get_conditional_headers(conn: sqlite3.Connection, feed_short: str) -> Dict[str, str]:
-    row = conn.execute("SELECT etag, last_modified FROM feed_meta WHERE feed = ?", (feed_short,)).fetchone()
+
+def _get_conditional_headers(
+    conn: sqlite3.Connection, feed_short: str
+) -> Dict[str, str]:
+    row = conn.execute(
+        "SELECT etag, last_modified FROM feed_meta WHERE feed = ?", (feed_short,)
+    ).fetchone()
     headers: Dict[str, str] = {}
     if row:
         if row["etag"]:
@@ -509,6 +562,7 @@ def _get_conditional_headers(conn: sqlite3.Connection, feed_short: str) -> Dict[
         if row["last_modified"]:
             headers["If-Modified-Since"] = row["last_modified"]
     return headers
+
 
 def _update_feed_meta(conn: sqlite3.Connection, feed_short: str, hdrs: Dict[str, str]):
     etag = hdrs.get("ETag") or hdrs.get("Etag")
@@ -520,7 +574,9 @@ def _update_feed_meta(conn: sqlite3.Connection, feed_short: str, hdrs: Dict[str,
     )
     conn.commit()
 
+
 # ---------- CLI Actions ----------
+
 
 def cmd_init(args):
     ensure_dirs()
@@ -536,6 +592,7 @@ def cmd_init(args):
         f"  YT dir:    {get_setting('download_yt_dir', DEFAULT_YT_DIR)}"
     )
 
+
 def cmd_list_feeds(args):
     cfg = read_podfile()
     feeds = cfg["feeds"]
@@ -548,6 +605,7 @@ def cmd_list_feeds(args):
         summ = (sums.get(sn) or "").strip()
         summ = f" — {summ[:80]}{'…' if len(summ) > 80 else ''}" if summ else ""
         print(f"  {sn}: {url}{summ}")
+
 
 def cmd_add_feed(args):
     short = args.short_name
@@ -566,6 +624,7 @@ def cmd_add_feed(args):
         conn.commit()
     print(f"Added RSS feed '{short}': {url}")
     print("Note: Feeds are validated as RSS during 'refresh'.")
+
 
 def cmd_remove_feed(args):
     short = args.short_name
@@ -592,6 +651,7 @@ def cmd_remove_feed(args):
     print(
         f"Removed feed '{short}' ({url}).{' Purged episodes.' if purge else ''}{' Deleted files.' if delete_files else ''}"
     )
+
 
 def cmd_rename_feed(args):
     old = args.old_short
@@ -642,6 +702,7 @@ def cmd_rename_feed(args):
 
     print(f"Renamed feed '{old}' → '{new}'")
 
+
 def cmd_set_summary(args):
     short = args.short_name
     summ = args.summary
@@ -652,7 +713,10 @@ def cmd_set_summary(args):
     write_podfile(cfg)
     print(f"Set summary for '{short}'.")
 
-def _fetch_feed_with_conditionals(conn: sqlite3.Connection, short: str, url: str) -> Optional[bytes]:
+
+def _fetch_feed_with_conditionals(
+    conn: sqlite3.Connection, short: str, url: str
+) -> Optional[bytes]:
     headers = _get_conditional_headers(conn, short)
     try:
         status, hdrs, body = http_get(url, headers=headers)
@@ -664,6 +728,7 @@ def _fetch_feed_with_conditionals(conn: sqlite3.Connection, short: str, url: str
     except Exception as e:
         eprint(f"  Error fetching feed: {e}")
         return None
+
 
 def cmd_refresh(args):
     cfg = read_podfile()
@@ -722,6 +787,7 @@ def cmd_refresh(args):
             conn.commit()
             print(f"  Added {added} new episode record(s)")
 
+
 def cmd_info(args):
     short = args.short_name
     cfg = read_podfile()
@@ -759,6 +825,7 @@ def cmd_info(args):
         print("\nSummary:")
         print(textwrap.fill(summary, width=88))
 
+
 def cmd_clean(args):
     short = args.short_name
     delete_files = args.delete_files
@@ -782,6 +849,7 @@ def cmd_clean(args):
             return
     print(f"Cleared download records for '{short}'.")
 
+
 def _episodes_for_download(
     conn: sqlite3.Connection,
     feed: str,
@@ -790,9 +858,7 @@ def _episodes_for_download(
     ids: Optional[List[int]],
     since: Optional[str],
 ) -> List[sqlite3.Row]:
-    base = (
-        "SELECT e.* FROM episodes e LEFT JOIN downloads d ON d.episode_id = e.id AND d.status = 'completed' WHERE e.feed = ? AND d.id IS NULL"
-    )
+    base = "SELECT e.* FROM episodes e LEFT JOIN downloads d ON d.episode_id = e.id AND d.status = 'completed' WHERE e.feed = ? AND d.id IS NULL"
     args = [feed]
     if ids:
         placeholders = ",".join("?" for _ in ids)
@@ -807,6 +873,7 @@ def _episodes_for_download(
         base += f" LIMIT {int(latest)}"
     return list(conn.execute(base, args))
 
+
 def _derive_filename(title: Optional[str], enclosure_url: Optional[str]) -> str:
     base = slugify(title or "episode")
     ext = ""
@@ -820,6 +887,7 @@ def _derive_filename(title: Optional[str], enclosure_url: Optional[str]) -> str:
     if ext.lower() not in (".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".opus"):
         ext = ext if ext else ".mp3"
     return base + ext
+
 
 def _download_one(
     conn: sqlite3.Connection, feed: str, row: sqlite3.Row, out_dir: str
@@ -863,16 +931,19 @@ def _download_one(
                 os.unlink(out_path)
         return False, None
 
+
 def _parallel_map(func, rows: Iterable, jobs: int) -> List:
     if jobs <= 1:
         return [func(r) for r in rows]
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
     results: List = []
     with ThreadPoolExecutor(max_workers=jobs) as ex:
         futs = [ex.submit(func, r) for r in rows]
         for fut in as_completed(futs):
             results.append(fut.result())
     return results
+
 
 def cmd_download(args):
     feed = args.feed
@@ -901,9 +972,11 @@ def cmd_download(args):
         def work(r):
             with connect_db() as c2:
                 return int(_download_one(c2, feed, r, out_dir)[0])
+
         for res in _parallel_map(work, rows, jobs):
             ok += int(res)
     print(f"Downloaded {ok}/{len(rows)} episodes.")
+
 
 def cmd_download_title(args):
     feed = args.feed
@@ -927,6 +1000,7 @@ def cmd_download_title(args):
         out_dir = get_feed_download_dir(feed)
         _download_one(conn, feed, row, out_dir)
 
+
 def _print_episode_list(rows: List[sqlite3.Row], show_feed: bool = False):
     if not rows:
         print("No episodes.")
@@ -940,6 +1014,7 @@ def _print_episode_list(rows: List[sqlite3.Row], show_feed: bool = False):
         else:
             print(f"id={eid}  {pd}  {title}")
 
+
 def cmd_search(args):
     feed = args.feed
     query = (args.query or "").strip().lower()
@@ -948,15 +1023,18 @@ def cmd_search(args):
     with connect_db() as conn:
         require_feed_exists(conn, feed)
         if args.fts:
-            rows = list(conn.execute(
-                """
+            rows = list(
+                conn.execute(
+                    """
                 SELECT e.*
                 FROM episodes_fts f
                 JOIN episodes e ON e.id = f.rowid
                 WHERE e.feed = ? AND episodes_fts MATCH ?
                 ORDER BY (e.pub_date IS NULL), e.pub_date DESC, e.id DESC
-                """, (feed, query)
-            ))
+                """,
+                    (feed, query),
+                )
+            )
         else:
             rows = list(
                 conn.execute(
@@ -970,21 +1048,25 @@ def cmd_search(args):
             )
     _print_episode_list(rows)
 
+
 def cmd_search_all(args):
     query = (args.query or "").strip().lower()
     if not query:
         raise SystemExit("Use --query 'text'.")
     with connect_db() as conn:
         if args.fts:
-            rows = list(conn.execute(
-                """
+            rows = list(
+                conn.execute(
+                    """
                 SELECT e.*
                 FROM episodes_fts f
                 JOIN episodes e ON e.id = f.rowid
                 WHERE episodes_fts MATCH ?
                 ORDER BY (e.pub_date IS NULL), e.pub_date DESC, e.id DESC
-                """, (query,)
-            ))
+                """,
+                    (query,),
+                )
+            )
         else:
             rows = list(
                 conn.execute(
@@ -997,6 +1079,7 @@ def cmd_search_all(args):
                 )
             )
     _print_episode_list(rows, show_feed=True)
+
 
 def cmd_queue_add(args):
     feed = args.feed
@@ -1037,6 +1120,7 @@ def cmd_queue_add(args):
         conn.commit()
         print(f"Queued: id={row['id']}  {row['title']}")
 
+
 def cmd_queue_list(args):
     with connect_db() as conn:
         rows = list(
@@ -1056,6 +1140,7 @@ def cmd_queue_list(args):
             f"queue_id={r['qid']}  [{r['feed']}] id={r['eid']}  {r['pub_date'] or ''}  {r['title'] or '(no title)'}"
         )
 
+
 def cmd_queue_remove(args):
     qid = args.queue_id
     eid = args.episode_id
@@ -1069,11 +1154,13 @@ def cmd_queue_remove(args):
         conn.commit()
     print("Removed from queue.")
 
+
 def cmd_queue_reset(args):
     with connect_db() as conn:
         conn.execute("DELETE FROM queue")
         conn.commit()
     print("Queue cleared.")
+
 
 def cmd_queue_download(args):
     jobs = int(args.jobs or 1)
@@ -1089,6 +1176,7 @@ def cmd_queue_download(args):
             print("Queue is empty.")
             return
     per_feed_dirs: Dict[str, str] = {}
+
     def path_for_feed(feed: str) -> str:
         d = per_feed_dirs.get(feed)
         if not d:
@@ -1096,6 +1184,7 @@ def cmd_queue_download(args):
             os.makedirs(d, exist_ok=True)
             per_feed_dirs[feed] = d
         return d
+
     def work(r):
         feed = r["feed"]
         out_dir = path_for_feed(feed)
@@ -1105,13 +1194,16 @@ def cmd_queue_download(args):
             c2.execute("DELETE FROM queue WHERE id = ?", (r["qid"],))
             c2.commit()
             return int(success)
+
     ok = 0
     for res in _parallel_map(work, rows, jobs):
         ok += int(res)
     print(f"Downloaded {ok}/{len(rows)} queued episodes.")
 
+
 def cmd_playlist(args):
     args.playlist_func(args)
+
 
 def playlist_create(args):
     name = args.name
@@ -1123,12 +1215,11 @@ def playlist_create(args):
         conn.commit()
     print(f"Playlist created: {name}")
 
+
 def playlist_list(args):
     with connect_db() as conn:
         rows = list(
-            conn.execute(
-                "SELECT name, created_at FROM playlists ORDER BY name ASC"
-            )
+            conn.execute("SELECT name, created_at FROM playlists ORDER BY name ASC")
         )
     if not rows:
         print("No playlists.")
@@ -1136,20 +1227,17 @@ def playlist_list(args):
     for r in rows:
         print(f"{r['name']}  (created {r['created_at']})")
 
+
 def playlist_add(args):
     name = args.name
     eid = args.episode_id
     if not eid:
         raise SystemExit("Provide --episode-id ID.")
     with connect_db() as conn:
-        pl = conn.execute(
-            "SELECT 1 FROM playlists WHERE name = ?", (name,)
-        ).fetchone()
+        pl = conn.execute("SELECT 1 FROM playlists WHERE name = ?", (name,)).fetchone()
         if not pl:
             raise SystemExit(f"Playlist '{name}' not found. Create it first.")
-        ep = conn.execute(
-            "SELECT id FROM episodes WHERE id = ?", (eid,)
-        ).fetchone()
+        ep = conn.execute("SELECT id FROM episodes WHERE id = ?", (eid,)).fetchone()
         if not ep:
             raise SystemExit("Episode not found.")
         pos_row = conn.execute(
@@ -1164,6 +1252,7 @@ def playlist_add(args):
         conn.commit()
     print(f"Added episode {eid} to playlist '{name}' at position {pos}.")
 
+
 def playlist_remove(args):
     name = args.name
     eid = args.episode_id
@@ -1174,6 +1263,7 @@ def playlist_remove(args):
         )
         conn.commit()
     print(f"Removed episode {eid} from playlist '{name}'.")
+
 
 def playlist_show(args):
     name = args.name
@@ -1196,6 +1286,7 @@ def playlist_show(args):
         print(
             f"{r['pos']:>3d}. [{r['feed']}] id={r['eid']}  {r['pub_date'] or ''}  {r['title'] or '(no title)'}"
         )
+
 
 def playlist_export(args):
     name = args.name
@@ -1222,7 +1313,9 @@ def playlist_export(args):
             f.write(os.path.abspath(r["file_path"]) + "\n")
     print(f"Exported playlist '{name}' to {out}")
 
+
 # ---------- OPML import/export ----------
+
 
 def _unique_short_name(base: str, existing: Iterable[str]) -> str:
     base = slugify(base, maxlen=40) or "feed"
@@ -1232,6 +1325,7 @@ def _unique_short_name(base: str, existing: Iterable[str]) -> str:
     while f"{base}{i}" in existing:
         i += 1
     return f"{base}{i}"
+
 
 def cmd_opml_import(args):
     path = os.path.expanduser(args.path)
@@ -1269,6 +1363,7 @@ def cmd_opml_import(args):
         conn.commit()
     print(f"Imported {added} feed(s) from {path}.")
 
+
 def cmd_opml_export(args):
     path = os.path.expanduser(args.path)
     cfg = read_podfile()
@@ -1287,7 +1382,9 @@ def cmd_opml_export(args):
     tree.write(path, encoding="utf-8", xml_declaration=True)
     print(f"Exported {len(feeds)} feed(s) to {path}.")
 
+
 # ---------- yt-dlp helpers ----------
+
 
 def run_yt_dlp(link: str, video: bool, out_dir: str):
     """Invoke yt-dlp to download a link as audio (default) or video.
@@ -1331,6 +1428,7 @@ def run_yt_dlp(link: str, video: bool, out_dir: str):
     except subprocess.CalledProcessError as e:
         raise SystemExit(f"yt-dlp failed with exit code {e.returncode}.")
 
+
 def cmd_download_yt(args):
     link = args.link
     if not link:
@@ -1341,7 +1439,9 @@ def cmd_download_yt(args):
         f"Saved to {os.path.abspath(os.path.expanduser(out_dir))} (mode: {'video' if args.video else 'audio-only'})"
     )
 
+
 # ---------- Argument Parser ----------
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1356,7 +1456,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_init)
 
     # list-feeds
-    p = sub.add_parser("list-feeds", help="List all configured podcast feeds (RSS only)")
+    p = sub.add_parser(
+        "list-feeds", help="List all configured podcast feeds (RSS only)"
+    )
     p.set_defaults(func=cmd_list_feeds)
 
     # add-feed
@@ -1407,9 +1509,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_set_summary)
 
     # clean
-    p = sub.add_parser(
-        "clean", help="Clear all download records for a podcast"
-    )
+    p = sub.add_parser("clean", help="Clear all download records for a podcast")
     p.add_argument("short_name", help="Feed short name")
     p.add_argument(
         "--delete-files",
@@ -1428,7 +1528,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Download latest N not-yet-downloaded episodes (default: 1)",
     )
-    p.add_argument("--all", action="store_true", help="Download all not-yet-downloaded episodes")
+    p.add_argument(
+        "--all", action="store_true", help="Download all not-yet-downloaded episodes"
+    )
     p.add_argument("--ids", help="Comma-separated episode IDs to download")
     p.add_argument(
         "--since", help="Only episodes with pub_date >= ISO date (e.g., 2024-01-01)"
@@ -1448,7 +1550,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("search", help="Search for episodes in a single podcast")
     p.add_argument("--feed", required=True, help="Feed short name")
     p.add_argument("--query", required=True, help="Text to search in title/description")
-    p.add_argument("--fts", action="store_true", help="Use FTS5 full-text search if available")
+    p.add_argument(
+        "--fts", action="store_true", help="Use FTS5 full-text search if available"
+    )
     p.set_defaults(func=cmd_search)
 
     # search-all
@@ -1456,7 +1560,9 @@ def build_parser() -> argparse.ArgumentParser:
         "search-all", help="Search for text across all episodes of all podcasts"
     )
     p.add_argument("--query", required=True, help="Text to search in title/description")
-    p.add_argument("--fts", action="store_true", help="Use FTS5 full-text search if available")
+    p.add_argument(
+        "--fts", action="store_true", help="Use FTS5 full-text search if available"
+    )
     p.set_defaults(func=cmd_search_all)
 
     # queue-add
@@ -1578,7 +1684,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     return parser
 
+
 # --- settings ---
+
 
 def cmd_set(args):
     made_change = False
@@ -1596,7 +1704,9 @@ def cmd_set(args):
             raise SystemExit("Use --dir PATH with --change-feed-dir FEED")
         set_feed_download_dir(args.change_feed_dir, args.feed_dir_path)
         made_change = True
-        print(f"Set custom dir for feed '{args.change_feed_dir}' → {os.path.abspath(os.path.expanduser(args.feed_dir_path))}")
+        print(
+            f"Set custom dir for feed '{args.change_feed_dir}' → {os.path.abspath(os.path.expanduser(args.feed_dir_path))}"
+        )
 
     if args.unset_feed_dir:
         unset_feed_download_dir(args.unset_feed_dir)
@@ -1621,7 +1731,9 @@ def cmd_set(args):
     if made_change and not args.show:
         print("Settings updated.")
 
+
 # ---------- Main ----------
+
 
 def main(argv=None):
     parser = build_parser()
@@ -1643,6 +1755,6 @@ def main(argv=None):
             traceback.print_exc()
         sys.exit(1)
 
+
 if __name__ == "__main__":
     main()
-

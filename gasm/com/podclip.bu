@@ -35,9 +35,19 @@ Quick examples:
   clipex space end
 """
 
-import argparse, csv, json, os, re, subprocess, sys, tempfile, textwrap, shutil, platform
+import argparse
+import csv
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 APP_NAME   = "clipex"
 APP_DESC   = "Cut podcast/music clips from MP3s; batch, concat, crossfade, gaps, loudness, and spaces.\n Run clipex podcast --help for downloading media."

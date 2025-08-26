@@ -2,50 +2,74 @@
 # -*- coding: utf-8 -*-
 
 """
-clipex — cut podcast/music clips; batch, concat, crossfade, gaps, loudness, and work in named spaces.
+clipex — cut podcast/music clips; batch, concat, crossfade, gaps, loudness,
+         named spaces, knobs, and now: parallel cuts, padding, trim-silence,
+         safer temp writes, and better metadata options.
 
-Now with friendly subcommands + knobs:
-  • clipex cut  …                # simple single-clip
-  • clipex batch …               # CSV-driven, optional join
-  • clipex join …                # concat existing parts
-  • clipex ez                    # interactive wizard
-  • clipex knob save|list|apply|delete  # reusable flag bundles ("knobs")
-  • clipex gen-completion        # print bash/zsh completion script (no deps)
+New/Improved (this build):
+  • Parallel batch cutting: --jobs N (safe, per-part temp file + atomic rename)
+  • Safer writes: write to .part then atomic rename to final
+  • Optional metadata copy: --copy-meta (copies tags from source)
+  • Per-clip padding: --pad-start / --pad-end
+  • Trim leading/trailing silence on each cut: --trim-silence [--silence-threshold --silence-min]
+  • Name helpers: --prefix / --suffix / --normalize-names
+  • Strict/lenient batch: --strict (fail-fast) or default keep-going
+  • ffmpeg presence check with friendly error
+  • Friendlier CSV errors remain (line numbers + format hints)
+  • Completion scripts updated
 
-Polish:
-  • --dry-run    print actions/ffmpeg commands without executing
-  • --progress   show ffmpeg -stats progress
-  • Friendlier CSV errors (line numbers + hints)
-  • Slightly nicer messages
+Core features you already had (still here):
+  • cut / batch / join / ez / knob / space / gen-completion
+  • crossfade or gaps, loudness target, mono/CBR, --copy for stream copy
+  • CSV rows may specify a different 'source' file per clip
+  • Spaces remember input/output defaults; knobs bundle favorite flags
+  • --dry-run + --progress + verbose
 """
 
-import argparse, csv, json, os, re, subprocess, sys, tempfile, textwrap, shutil, platform
+import argparse
+import csv
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-APP_NAME   = "clipex"
-APP_DESC   = "Cut podcast/music clips from MP3s; batch, concat, crossfade, gaps, loudness, spaces, and knobs."
-APP_VER    = "1.8.0"
+APP_NAME = "clipex"
+APP_DESC = "cut podcast/music clips from MP3s."
+APP_VER = "2.0.0"
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "apps/.app-data/.config-files")) / APP_NAME
-CONFIG_PATH= CONFIG_DIR / "config.json"
+CONFIG_DIR = (
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / "apps/.app-data/.config-files/clipex"))
+    / APP_NAME
+)
+CONFIG_PATH = CONFIG_DIR / "config.json"
 
 # Globals toggled by CLI
-VERBOSE    = False
-OVERWRITE  = False
-PROGRESS   = False   # show ffmpeg -stats
-DRY_RUN    = False   # print commands only
+VERBOSE = False
+OVERWRITE = False
+PROGRESS = False  # show ffmpeg -stats
+DRY_RUN = False  # print commands only
 
 # ---------- Help & UX ----------
 
-class _SmartFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
+class _SmartFormatter(
+    argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter
+):
     """Shows defaults + preserves newlines/indent."""
     pass
 
 def _dedent(s: str) -> str:
     return textwrap.dedent(s).strip("\n")
 
-EXAMPLES_TEXT = _dedent(f"""
+EXAMPLES_TEXT = _dedent(
+    f"""
 General:
   {APP_NAME} --help
   {APP_NAME} --version
@@ -59,6 +83,8 @@ Single clip:
   {APP_NAME} -i INPUT.mp3 --start "3:50.250" --end "4:50.750" --name intro
   {APP_NAME} -i INPUT.mp3 --start 235.1 --end 300.9 --name funny_bit --edge-fade 0.02
   {APP_NAME} -i INPUT.mp3 --start 3:55 --end 4:55.500 --name teaser --mono --cbr 192k --play
+  # Add small padding around the cut, trim silence, and copy metadata
+  {APP_NAME} -i INPUT.mp3 --start 3:55 --end 4:55 --pad-start 0.05 --pad-end 0.05 --trim-silence --copy-meta -n teaser2
 
 Batch (CSV format):
   # clips.csv
@@ -68,7 +94,7 @@ Batch (CSV format):
   2:35.100,3:33.900,funny_bit,Hosts crack up
   420.0,505.5,,
 
-  {APP_NAME} -i INPUT.mp3 -f clips.csv
+  {APP_NAME} -i INPUT.mp3 -f clips.csv --jobs 4
 
 Multi-input CSV (per-row 'source' optional):
   # clips.csv
@@ -110,18 +136,20 @@ Knobs:
   {APP_NAME} knob save podcast --xfade 1.0 --loudnorm -16 --mono
   {APP_NAME} knob list
   {APP_NAME} cut -n intro --knob podcast INPUT.mp3 0:10 0:30
-""")
+"""
+)
 
 def print_examples_and_exit():
     print(EXAMPLES_TEXT)
     sys.exit(0)
 
 def print_topic_help_and_exit(parser: argparse.ArgumentParser, topic: Optional[str]):
-    # topic can be "run" or "set" or "space" or None
     if not topic or topic.lower() not in {"run", "set", "space"}:
         parser.print_help()
         sys.exit(0)
-    subparsers_action = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    subparsers_action = next(
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    )
     sp = subparsers_action.choices[topic.lower()]
     sp.print_help()
     sys.exit(0)
@@ -168,7 +196,8 @@ def ensure_outdir(path: Optional[str], cfg: dict) -> Path:
     else:
         cur = get_current_space(cfg)
         if cur:
-            out = Path(get_spaces(cfg).get(cur, {}).get("out", "")) if get_spaces(cfg).get(cur, {}).get("out") else None
+            out_str = get_spaces(cfg).get(cur, {}).get("out")
+            out = Path(out_str).expanduser() if out_str else None
         if not out:
             out = Path(cfg.get("output_default", "."))
     if not DRY_RUN:
@@ -195,12 +224,19 @@ def resolve_input_path(user_path: str, cfg: dict) -> Path:
 
 def ffmpeg_base_args() -> List[str]:
     args = ["-hide_banner"]
-    # -stats vs -nostats
-    args += (["-stats"] if PROGRESS else ["-nostats"])
+    args += ["-stats"] if PROGRESS else ["-nostats"]
     args += ["-loglevel", "info" if VERBOSE else "error"]
     if OVERWRITE:
         args += ["-y"]
+    else:
+        args += ["-n"]
     return args
+
+def ensure_ffmpeg_present() -> None:
+    if shutil.which("ffmpeg"):
+        return
+    print("error: ffmpeg not found on PATH. Please install ffmpeg.", file=sys.stderr)
+    sys.exit(127)
 
 def run_subprocess(cmd: List[str]) -> int:
     if VERBOSE or DRY_RUN:
@@ -217,16 +253,12 @@ def run_subprocess(cmd: List[str]) -> int:
 # - H:MM:SS(.ms)
 # - seconds(.ms)
 TIME_PATTERNS = [
-    re.compile(r"^(?P<m>\d+):(?P<s>[0-5]?\d(?:\.\d+)?)$"),                 # M:SS(.ms)
-    re.compile(r"^(?P<h>\d+):(?P<m>[0-5]?\d):(?P<s>[0-5]?\d(?:\.\d+)?)$"), # H:MM:SS(.ms)
-    re.compile(r"^(?P<s>\d+(?:\.\d+)?)$"),                                 # seconds(.ms)
+    re.compile(r"^(?P<m>\d+):(?P<s>[0-5]?\d(?:\.\d+)?)$"),  # M:SS(.ms)
+    re.compile(r"^(?P<h>\d+):(?P<m>[0-5]?\d):(?P<s>[0-5]?\d(?:\.\d+)?)$"),  # H:MM:SS(.ms)
+    re.compile(r"^(?P<s>\d+(?:\.\d+)?)$"),  # seconds(.ms)
 ]
 
 def parse_time(ts: str) -> float:
-    """
-    Parse time strings with optional milliseconds.
-    Accepts: M:SS(.ms) | H:MM:SS(.ms) | seconds(.ms)
-    """
     s = ts.strip()
     for pat in TIME_PATTERNS:
         m = pat.match(s)
@@ -235,10 +267,18 @@ def parse_time(ts: str) -> float:
             m_ = float(m.groupdict().get("m") or 0)
             s_ = float(m.groupdict().get("s") or 0)
             return h * 3600.0 + m_ * 60.0 + s_
-    raise ValueError(f"Invalid time format: {ts!r}  (use M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
+    raise ValueError(
+        f"Invalid time format: {ts!r}  (use M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))"
+    )
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
+
+def normalize_name(name: str) -> str:
+    # lower, spaces->underscores, strip redundant underscores
+    s = sanitize_filename(name).strip().lower().replace(" ", "_")
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "clip"
 
 def choose_encode_args(cbr: Optional[str], mono: bool) -> List[str]:
     """
@@ -259,7 +299,7 @@ def choose_encode_args(cbr: Optional[str], mono: bool) -> List[str]:
 def find_player() -> Optional[List[str]]:
     """
     Returns a command list for a suitable audio player (blocking preferred).
-    Tries: ffplay -autoexit, afplay (macOS), mpg123, cvlc, play (sox), powershell WMPlayer fallback.
+    Tries: ffplay -autoexit, afplay (macOS), mpg123, cvlc, play (sox), powershell fallback.
     """
     if shutil.which("ffplay"):
         return ["ffplay", *ffmpeg_base_args(), "-autoexit"]
@@ -269,9 +309,8 @@ def find_player() -> Optional[List[str]]:
         return ["mpg123", "-q"]
     if shutil.which("cvlc"):
         return ["cvlc", "--play-and-exit", "--quiet"]
-    if shutil.which("play"):  # from sox
+    if shutil.which("play"):
         return ["play", "-q"]
-    # Windows basic fallback using start (non-blocking) – still acceptable
     if platform.system() == "Windows":
         return ["cmd", "/c", "start", ""]
     return None
@@ -288,6 +327,20 @@ def play_file(path: Path) -> None:
 
 # ---------- Cutting & parsing ----------
 
+def make_atomic_target(target: Path) -> Tuple[Path, Path]:
+    """Return (.part path, final target). Caller must rename on success."""
+    tmp = target.with_suffix(target.suffix + ".part")
+    return tmp, target
+
+def build_trim_silence_filter(enable: bool, thr: float, min_dur: float) -> Optional[str]:
+    if not enable:
+        return None
+    # silenceremove: remove leading/trailing silence
+    # a noise threshold in dB (negative); e.g., -50dB typical for podcasts
+    thr_db = f"{thr:.1f}dB"
+    # remove silence at start and end
+    return f"silenceremove=start_periods=1:start_threshold={thr_db}:start_silence={min_dur}:stop_periods=1:stop_threshold={thr_db}:stop_silence={min_dur}"
+
 def run_ffmpeg_cut(
     input_mp3: Path,
     start_s: float,
@@ -298,42 +351,83 @@ def run_ffmpeg_cut(
     copy: bool = False,
     edge_fade: float = 0.0,
     cbr: Optional[str] = None,
+    mono: bool = False,
+    copy_meta: bool = False,
+    trim_silence: bool = False,
+    silence_threshold_db: float = -50.0,
+    silence_min: float = 0.02,
+    prefix: str = "",
+    suffix: str = "",
 ) -> None:
     """
     Cut a segment from input. If edge_fade>0, apply tiny fades to prevent clicks (re-encode).
-    If copy=True and edge_fade>0 or cbr set, copy is ignored (we re-encode).
+    If copy=True and any filter/mono/cbr enabled, we re-encode automatically.
+    Uses .part temp file then atomic rename.
     """
+    ensure_ffmpeg_present()
     if end_s <= start_s:
         raise ValueError("end must be greater than start")
+
     duration = end_s - start_s
 
+    # finalize out path with prefix/suffix
+    final_out = out_path
+    if prefix or suffix:
+        final_out = final_out.with_name(f"{prefix}{final_out.stem}{suffix}{final_out.suffix}")
+    tmp_out, final_out = make_atomic_target(final_out)
+
     meta = []
-    if title:   meta += ["-metadata", f"title={title}"]
-    if comment: meta += ["-metadata", f"comment={comment}"]
+    if title:
+        meta += ["-metadata", f"title={title}"]
+    if comment:
+        meta += ["-metadata", f"comment={comment}"]
 
     cmd = [
-        "ffmpeg", *ffmpeg_base_args(),
-        "-ss", f"{start_s:.3f}", "-t", f"{duration:.3f}",
-        "-i", str(input_mp3),
+        "ffmpeg",
+        *ffmpeg_base_args(),
+        "-ss",
+        f"{start_s:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(input_mp3),
     ]
 
-    if copy and edge_fade <= 0 and not cbr:
+    filter_chain: List[str] = []
+    # optional trim-silence on the clipped segment (requires re-encode)
+    tsf = build_trim_silence_filter(trim_silence, silence_threshold_db, silence_min)
+    if tsf:
+        filter_chain.append(tsf)
+
+    # edge fades
+    if edge_fade > 0:
+        st_out = max(0.0, duration - edge_fade)
+        filter_chain.append(f"afade=t=in:st=0:d={edge_fade}")
+        filter_chain.append(f"afade=t=out:st={st_out:.3f}:d={edge_fade}")
+
+    # decide copy vs encode
+    reencode_needed = bool(filter_chain) or mono or bool(cbr)
+    if copy and not reencode_needed:
         codec_args = ["-c", "copy"]
         filter_args: List[str] = []
     else:
-        codec_args = choose_encode_args(cbr=cbr, mono=False)
-        filter_chain = []
-        if edge_fade > 0:
-            st_out = max(0.0, duration - edge_fade)
-            filter_chain.append(f"afade=t=in:st=0:d={edge_fade}")
-            filter_chain.append(f"afade=t=out:st={st_out:.3f}:d={edge_fade}")
+        codec_args = choose_encode_args(cbr=cbr, mono=mono)
         filter_args = ["-af", ",".join(filter_chain)] if filter_chain else []
-        if copy and (edge_fade > 0 or cbr):
-            print(f"note: re-encoding {out_path.name} (copy disabled by --edge-fade/--cbr)")
+        if copy and reencode_needed:
+            print(f"note: re-encoding {final_out.name} (copy disabled by filters/mono/CBR)")
 
-    cmd += filter_args + codec_args + meta + [str(out_path)]
+    # metadata copying
+    meta_copy_args: List[str] = []
+    if copy_meta:
+        meta_copy_args = ["-map_metadata", "0"]
+
+    cmd += filter_args + codec_args + meta_copy_args + meta + [str(tmp_out)]
     if run_subprocess(cmd) != 0:
-        raise RuntimeError(f"ffmpeg failed for {out_path.name}")
+        raise RuntimeError(f"ffmpeg failed for {final_out.name}")
+
+    # atomic rename
+    if not DRY_RUN:
+        tmp_out.replace(final_out)
 
 def sniff_has_header(row: List[str]) -> bool:
     joined = ",".join(c.strip().lower() for c in row)
@@ -341,7 +435,7 @@ def sniff_has_header(row: List[str]) -> bool:
 
 def parse_batch_file(path: Path) -> Tuple[str, List[dict]]:
     """
-    CSV format (now allows optional 'source' per row):
+    CSV format (allows optional 'source' per row):
       #default, Your default description (optional; first such line wins)
       start,end,name,description[,source]
       3:55.000,4:55.250,hot_take,#default,ep1.mp3
@@ -371,59 +465,78 @@ def parse_batch_file(path: Path) -> Tuple[str, List[dict]]:
                     first_row = None
                     continue
             row = raw if first_row is None else first_row
-            # Reset so header is only used once
             first_row = None
 
-            # normalize to up to 5 cols: start,end,name,description,source?
             row = (row + ["", "", "", "", ""])[:5]
             start, end, name, desc, source = [c.strip() for c in row[:5]]
             if not start or not end:
-                raise ValueError(f"CSV error at line {line_no}: missing start/end. Row={row}")
+                raise ValueError(
+                    f"CSV error at line {line_no}: missing start/end. Row={row}"
+                )
             try:
                 start_s = parse_time(start)
             except Exception:
-                raise ValueError(f"CSV error at line {line_no}: bad start time {start!r} (use M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
+                raise ValueError(
+                    f"CSV error at line {line_no}: bad start time {start!r} (use M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))"
+                )
             try:
                 end_s = parse_time(end)
             except Exception:
-                raise ValueError(f"CSV error at line {line_no}: bad end time {end!r} (use M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
+                raise ValueError(
+                    f"CSV error at line {line_no}: bad end time {end!r} (use M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))"
+                )
             nm = sanitize_filename(name) if name else ""
             description = default_desc if (desc == "#default" or desc == "") else desc
-            clips.append({
-                "start_s": start_s,
-                "end_s": end_s,
-                "name": nm,
-                "description": description,
-                "source": source,
-            })
+            clips.append(
+                {
+                    "start_s": start_s,
+                    "end_s": end_s,
+                    "name": nm,
+                    "description": description,
+                    "source": source,
+                }
+            )
     return default_desc, clips
 
-def derive_outfile(base_dir: Path, base_name: Optional[str], idx: int) -> Path:
-    stem = sanitize_filename(base_name) if base_name else f"clip_{idx:02d}"
+def derive_outfile(base_dir: Path, base_name: Optional[str], idx: int, normalize: bool) -> Path:
+    stem_raw = base_name if base_name else f"clip_{idx:02d}"
+    stem = normalize_name(stem_raw) if normalize else sanitize_filename(stem_raw) or f"clip_{idx:02d}"
     return base_dir / f"{stem}.mp3"
 
 # ---------- Concat helpers ----------
 
-def make_silence_mp3(path: Path, duration: float, cbr: Optional[str], mono: bool) -> None:
+def make_silence_mp3(
+    path: Path, duration: float, cbr: Optional[str], mono: bool
+) -> None:
     """Create a silent MP3 of given duration (seconds) using anullsrc."""
     if duration <= 0:
         return
+    ensure_ffmpeg_present()
+    tmp, final = make_atomic_target(path)
     cmd = [
-        "ffmpeg", *ffmpeg_base_args(),
-        "-f", "lavfi", "-t", f"{duration:.3f}",
-        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "ffmpeg",
+        *ffmpeg_base_args(),
+        "-f",
+        "lavfi",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        "anullsrc=channel_layout=stereo:sample_rate=44100",
         *choose_encode_args(cbr=cbr, mono=mono),
-        str(path)
+        str(tmp),
     ]
     if run_subprocess(cmd) != 0:
         raise RuntimeError("failed to generate silence clip")
+    if not DRY_RUN:
+        tmp.replace(final)
 
-def build_xfade_filter(n_parts: int, xfade: float, shape: str,
-                       add_limiter: bool, loudnorm_i: Optional[float]) -> Tuple[str, str]:
-    """
-    Build a filter_complex acrossfade chain.
-    Returns (filter_complex, final_label).
-    """
+def build_xfade_filter(
+    n_parts: int,
+    xfade: float,
+    shape: str,
+    add_limiter: bool,
+    loudnorm_i: Optional[float],
+) -> Tuple[str, str]:
     if n_parts == 1:
         return "", "0:a"
 
@@ -436,7 +549,9 @@ def build_xfade_filter(n_parts: int, xfade: float, shape: str,
     for i in range(1, n_parts):
         cur = f"{i}:a"
         out = f"af{i}"
-        filters.append(f"[{prev}][{cur}]acrossfade=d={xfade}:c1={shape}:c2={shape}[{out}]")
+        filters.append(
+            f"[{prev}][{cur}]acrossfade=d={xfade}:c1={shape}:c2={shape}[{out}]"
+        )
         prev = out
 
     final_label = prev
@@ -449,18 +564,37 @@ def build_xfade_filter(n_parts: int, xfade: float, shape: str,
 
     return ";".join(filters), final_label
 
-def ffmpeg_concat_list(list_file: Path, out_path: Path, copy: bool,
-                       title: Optional[str], comment: Optional[str],
-                       filter_a: Optional[str], cbr: Optional[str], mono: bool) -> None:
-    """
-    Concat demuxer path. If filter_a provided or mono/cbr requested, we re-encode; else stream copy.
-    """
-    meta = []
-    if title:   meta += ["-metadata", f"title={title}"]
-    if comment: meta += ["-metadata", f"comment={comment}"]
+def ffmpeg_concat_list(
+    list_file: Path,
+    out_path: Path,
+    copy: bool,
+    title: Optional[str],
+    comment: Optional[str],
+    filter_a: Optional[str],
+    cbr: Optional[str],
+    mono: bool,
+    copy_meta: bool,
+) -> None:
+    """Concat demuxer path. If filter_a provided or mono/cbr requested, we re-encode; else stream copy."""
+    ensure_ffmpeg_present()
+    tmp, final = make_atomic_target(out_path)
 
-    cmd = ["ffmpeg", *ffmpeg_base_args(),
-           "-f", "concat", "-safe", "0", "-i", str(list_file)]
+    meta = []
+    if title:
+        meta += ["-metadata", f"title={title}"]
+    if comment:
+        meta += ["-metadata", f"comment={comment}"]
+
+    cmd = [
+        "ffmpeg",
+        *ffmpeg_base_args(),
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_file),
+    ]
 
     must_encode = bool(filter_a) or mono or not copy or bool(cbr)
     if must_encode:
@@ -470,25 +604,42 @@ def ffmpeg_concat_list(list_file: Path, out_path: Path, copy: bool,
     else:
         cmd += ["-c", "copy"]
 
-    cmd += meta + [str(out_path)]
+    if copy_meta:
+        cmd += ["-map_metadata", "0"]
+
+    cmd += meta + [str(tmp)]
     if run_subprocess(cmd) != 0:
         raise RuntimeError(f"ffmpeg concat failed for {out_path.name}")
+    if not DRY_RUN:
+        tmp.replace(final)
 
-def ffmpeg_concat_xfade(parts: List[Path], out_path: Path, xfade: float, shape: str,
-                        title: Optional[str], comment: Optional[str],
-                        cbr: Optional[str], mono: bool,
-                        add_limiter: bool, loudnorm_i: Optional[float]) -> None:
-    """
-    Multi-input, filter_complex acrossfade with optional limiter/loudnorm.
-    Always re-encodes the final output.
-    """
+def ffmpeg_concat_xfade(
+    parts: List[Path],
+    out_path: Path,
+    xfade: float,
+    shape: str,
+    title: Optional[str],
+    comment: Optional[str],
+    cbr: Optional[str],
+    mono: bool,
+    add_limiter: bool,
+    loudnorm_i: Optional[float],
+    copy_meta: bool,
+) -> None:
+    """Multi-input, filter_complex acrossfade with optional limiter/loudnorm (re-encodes)."""
+    ensure_ffmpeg_present()
+    tmp, final = make_atomic_target(out_path)
+
     cmd = ["ffmpeg", *ffmpeg_base_args()]
     for p in parts:
         cmd += ["-i", str(p)]
 
     filter_complex, final_label = build_xfade_filter(
-        n_parts=len(parts), xfade=xfade, shape=shape,
-        add_limiter=add_limiter, loudnorm_i=loudnorm_i
+        n_parts=len(parts),
+        xfade=xfade,
+        shape=shape,
+        add_limiter=add_limiter,
+        loudnorm_i=loudnorm_i,
     )
 
     if filter_complex:
@@ -497,87 +648,115 @@ def ffmpeg_concat_xfade(parts: List[Path], out_path: Path, xfade: float, shape: 
         cmd += ["-map", "0:a"]
 
     cmd += choose_encode_args(cbr=cbr, mono=mono)
-    if title:   cmd += ["-metadata", f"title={title}"]
-    if comment: cmd += ["-metadata", f"comment={comment}"]
-    cmd += [str(out_path)]
+    if copy_meta:
+        cmd += ["-map_metadata", "0"]
+    if title:
+        cmd += ["-metadata", f"title={title}"]
+    if comment:
+        cmd += ["-metadata", f"comment={comment}"]
+    cmd += [str(tmp)]
     if run_subprocess(cmd) != 0:
         raise RuntimeError(f"ffmpeg xfade failed for {out_path.name}")
+    if not DRY_RUN:
+        tmp.replace(final)
 
 # ---------- Commands ----------
 
 def cmd_set(args):
-    """Implements `clipex set`."""
     cfg = load_config()
     if args.output_default:
         cfg["output_default"] = str(Path(args.output_default).expanduser())
         save_config(cfg)
         print(f"Set output default to: {cfg['output_default']}")
 
-def _validate_inputs_exist(inputs: List[Path]):
+def _validate_inputs_exist(inputs: Iterable[Path]):
     for p in inputs:
         if not p.exists():
-            print(f"error: input file not found: {p}", file=sys.stderr); sys.exit(2)
+            print(f"error: input file not found: {p}", file=sys.stderr)
+            sys.exit(2)
+
+def _derive_clip_name(base_name: Optional[str], idx: int, normalize: bool) -> str:
+    if base_name:
+        return normalize_name(base_name) if normalize else sanitize_filename(base_name)
+    return f"clip_{idx:02d}"
 
 def cmd_run(args):
-    """Implements `clipex run` (default)."""
     cfg = load_config()
     if args.examples:
         print_examples_and_exit()
 
     # guard: incompatible combos
     if args.parts and (args.file or args.start or args.end):
-        print("error: --parts cannot be combined with --start/--end or -f/--file", file=sys.stderr); sys.exit(2)
+        print("error: --parts cannot be combined with --start/--end or -f/--file",
+              file=sys.stderr)
+        sys.exit(2)
 
-    # resolve inputs list (may be None, 1+, or unused when every CSV row has a source)
+    # resolve inputs list
     inputs: List[Path] = []
     if args.input:
         for i in args.input:
             p = resolve_input_path(i, cfg)
             if not p.exists():
-                print(f"error: input file not found: {p}", file=sys.stderr); sys.exit(2)
+                print(f"error: input file not found: {p}", file=sys.stderr)
+                sys.exit(2)
             inputs.append(p)
 
     outdir = ensure_outdir(args.output, cfg)
 
-    # SINGLE CLIP (no concat)
+    # SINGLE CLIP
     if args.start and args.end and not args.concat and not args.parts and not args.file:
         if len(inputs) != 1:
-            print("error: single-clip mode requires exactly one -i/--input", file=sys.stderr); sys.exit(2)
+            print("error: single-clip mode requires exactly one -i/--input", file=sys.stderr)
+            sys.exit(2)
         input_mp3 = inputs[0]
-        start_s = parse_time(args.start); end_s = parse_time(args.end)
-        name = sanitize_filename(args.name) if args.name else f"{input_mp3.stem}_{int(start_s)}-{int(end_s)}"
-        out_path = outdir / f"{name}.mp3"
-        # stream copy only if no re-encode features requested
-        copy = args.copy and args.edge_fade <= 0 and not args.mono and not args.cbr
+        start_s = parse_time(args.start) - max(0.0, args.pad_start or 0.0)
+        end_s = parse_time(args.end) + max(0.0, args.pad_end or 0.0)
+
+        base_name = args.name or f"{input_mp3.stem}_{int(start_s)}-{int(end_s)}"
+        clip_name = normalize_name(base_name) if args.normalize_names else sanitize_filename(base_name)
+        out_path = outdir / f"{clip_name}.mp3"
+
+        copy = args.copy and args.edge_fade <= 0 and not args.mono and not args.cbr and not args.trim_silence
         run_ffmpeg_cut(
-            input_mp3, start_s, end_s, out_path,
-            title=args.name or name,
+            input_mp3,
+            start_s,
+            end_s,
+            out_path,
+            title=args.name or clip_name,
             comment=args.info,
             copy=copy,
             edge_fade=max(0.0, args.edge_fade),
-            cbr=args.cbr
+            cbr=args.cbr,
+            mono=args.mono,
+            copy_meta=args.copy_meta,
+            trim_silence=bool(args.trim_silence),
+            silence_threshold_db=args.silence_threshold,
+            silence_min=args.silence_min,
+            prefix=args.prefix or "",
+            suffix=args.suffix or "",
         )
-        if args.mono and copy:
-            print("note: --mono requires re-encode; ignoring --copy for single clip")
-        print(f"wrote {out_path}")
+        print(f"wrote {out_path if not (args.prefix or args.suffix) else out_path.with_name((args.prefix or '') + out_path.stem + (args.suffix or '') + out_path.suffix)}")
         if args.play:
-            play_file(out_path)
+            # compute final filename with prefix/suffix
+            final_name = out_path.with_name((args.prefix or "") + out_path.stem + (args.suffix or "") + out_path.suffix)
+            play_file(final_name)
         return
 
-    # PARTS-ONLY CONCAT: build a supercut from existing clip files
+    # PARTS-ONLY CONCAT
     if args.parts:
         parts = []
         for mp in args.parts:
             p = resolve_input_path(mp, cfg)
             if not p.exists():
-                print(f"error: part not found: {p}", file=sys.stderr); sys.exit(2)
+                print(f"error: part not found: {p}", file=sys.stderr)
+                sys.exit(2)
             parts.append(p)
 
         if not args.concat:
-            # if user forgot --concat, assume they wanted one file
             args.concat = True
 
-        merged_name = sanitize_filename(args.name) if args.name else "supercut"
+        merged_name_base = args.name or "supercut"
+        merged_name = normalize_name(merged_name_base) if args.normalize_names else sanitize_filename(merged_name_base)
         merged_out = outdir / f"{merged_name}.mp3"
 
         if args.xfade > 0 and len(parts) >= 2:
@@ -591,11 +770,11 @@ def cmd_run(args):
                 cbr=args.cbr,
                 mono=args.mono,
                 add_limiter=True,
-                loudnorm_i=(args.loudnorm if args.loudnorm is not None else None)
+                loudnorm_i=(args.loudnorm if args.loudnorm is not None else None),
+                copy_meta=args.copy_meta,
             )
             print(f"wrote {merged_out}")
         else:
-            # optionally insert gaps
             tmp_dir = Path(tempfile.mkdtemp(prefix="clipex_", dir=str(outdir)))
             try:
                 if args.gap > 0 and len(parts) >= 2:
@@ -613,7 +792,6 @@ def cmd_run(args):
                     for p in parts:
                         lf.write(f"file '{p.as_posix()}'\n")
 
-                # Post-filter chain for final (limiter always on; loudnorm optional)
                 filter_chain = ["alimiter=limit=0.90"]
                 if args.loudnorm is not None:
                     filter_chain.append(f"loudnorm=I={args.loudnorm}:TP=-1.5:LRA=11")
@@ -627,16 +805,16 @@ def cmd_run(args):
                     comment=args.info,
                     filter_a=filter_a,
                     cbr=args.cbr,
-                    mono=args.mono
+                    mono=args.mono,
+                    copy_meta=args.copy_meta,
                 )
                 print(f"wrote {merged_out}")
             finally:
                 if not DRY_RUN:
                     for p in tmp_dir.glob("*"):
-                        try: p.unlink()
-                        except: pass
-                    try: tmp_dir.rmdir()
-                    except: pass
+                        with contextliblib_suppress(): p.unlink()
+                    with contextliblib_suppress(): tmp_dir.rmdir()
+
         if args.play:
             play_file(merged_out)
         return
@@ -645,66 +823,124 @@ def cmd_run(args):
     if args.file:
         batch_path = resolve_input_path(args.file, cfg)
         if not batch_path.exists():
-            print(f"error: batch file not found: {batch_path}", file=sys.stderr); sys.exit(2)
+            print(f"error: batch file not found: {batch_path}", file=sys.stderr)
+            sys.exit(2)
 
         default_desc, clips = parse_batch_file(batch_path)
         if not clips:
-            print("no clips found in batch file", file=sys.stderr); sys.exit(2)
+            print("no clips found in batch file", file=sys.stderr)
+            sys.exit(2)
 
-        # Prepare cut parts
+        # Prepare cut parts (possibly parallel)
         tmp_dir = None
         if args.concat:
             tmp_dir = Path(tempfile.mkdtemp(prefix="clipex_", dir=str(ensure_outdir(args.output, cfg))))
-        try:
-            parts: List[Path] = []
-            for i, c in enumerate(clips, 1):
-                # resolve source for this row:
+
+        failures: List[str] = []
+        parts: List[Path] = []
+
+        def do_cut(i: int, c: dict) -> Tuple[int, Optional[Path], Optional[str]]:
+            try:
+                # resolve per-row source:
                 src_text = c.get("source") or ""
                 if src_text:
                     src_path = resolve_input_path(src_text, cfg)
                     if not src_path.exists():
-                        print(f"error: source not found for row {i}: {src_path}", file=sys.stderr); sys.exit(2)
+                        return (i, None, f"source not found for row {i}: {src_path}")
                     input_mp3 = src_path
                 else:
                     if not inputs:
-                        print("error: no input provided for row without 'source' (use -i/--input or add 'source' in CSV)", file=sys.stderr); sys.exit(2)
+                        return (i, None, "no input provided for row without 'source' (use -i/--input or add 'source' in CSV)")
                     input_mp3 = inputs[0]
 
+                # determine output path
                 if args.concat:
-                    part_path = (tmp_dir / f"part_{i:02d}.mp3")
+                    part_path = tmp_dir / f"part_{i:02d}.mp3"
                 else:
-                    part_path = derive_outfile(outdir, c.get("name"), i)
+                    out_path = derive_outfile(outdir, c.get("name"), i, args.normalize_names)
+                    part_path = out_path
 
-                part_copy = args.copy and args.edge_fade <= 0 and not args.cbr
+                # compute range with padding
+                start_s = c["start_s"] - max(0.0, args.pad_start or 0.0)
+                end_s = c["end_s"] + max(0.0, args.pad_end or 0.0)
+
+                part_copy = args.copy and args.edge_fade <= 0 and not args.cbr and not args.mono and not args.trim_silence
                 run_ffmpeg_cut(
-                    input_mp3, c["start_s"], c["end_s"], part_path,
-                    title=part_path.stem,
+                    input_mp3,
+                    start_s,
+                    end_s,
+                    part_path,
+                    title=Path(part_path).stem,
                     comment=c.get("description") or args.info or default_desc,
                     copy=part_copy,
                     edge_fade=max(0.0, args.edge_fade),
-                    cbr=args.cbr
+                    cbr=args.cbr,
+                    mono=args.mono,
+                    copy_meta=args.copy_meta,
+                    trim_silence=bool(args.trim_silence),
+                    silence_threshold_db=args.silence_threshold,
+                    silence_min=args.silence_min,
+                    prefix=args.prefix or "",
+                    suffix=args.suffix or "",
                 )
-                parts.append(part_path)
-                if not args.concat:
-                    print(f"wrote {part_path}")
+                return (i, part_path if not (args.prefix or args.suffix) else part_path.with_name((args.prefix or "") + part_path.stem + (args.suffix or "") + part_path.suffix), None)
+            except Exception as e:
+                return (i, None, f"{e}")
 
-            if not args.concat:
-                if args.play and parts:
-                    print("note: --play with batch (no --concat) will play only the last written clip.")
-                    play_file(parts[-1])
-                return
+        # run (maybe parallel)
+        jobs = max(1, int(args.jobs or 1))
+        if jobs == 1:
+            for i, c in enumerate(clips, 1):
+                idx, pth, err = do_cut(i, c)
+                if err:
+                    msg = f"row {idx}: {err}"
+                    if args.strict:
+                        raise RuntimeError(msg)
+                    failures.append(msg)
+                else:
+                    parts.append(pth)  # type: ignore
+                    if not args.concat:
+                        print(f"wrote {pth}")
+        else:
+            with ThreadPoolExecutor(max_workers=jobs) as ex:
+                futs = [ex.submit(do_cut, i, c) for i, c in enumerate(clips, 1)]
+                for fut in as_completed(futs):
+                    idx, pth, err = fut.result()
+                    if err:
+                        msg = f"row {idx}: {err}"
+                        if args.strict:
+                            raise RuntimeError(msg)
+                        failures.append(msg)
+                    else:
+                        parts.append(pth)  # type: ignore
+                        if not args.concat and VERBOSE:
+                            print(f"wrote {pth}")
 
-            # CONCAT PATH
-            merged_name = sanitize_filename(args.name) if args.name else f"{Path(inputs[0]).stem if inputs else 'highlights'}_highlights"
-            merged_out = outdir / f"{merged_name}.mp3"
+        if failures:
+            print("Completed with errors:", file=sys.stderr)
+            for m in failures:
+                print("  -", m, file=sys.stderr)
 
-            # If both xfade and gap provided, prefer xfade
-            if args.gap > 0 and args.xfade > 0:
-                print("note: both --xfade and --gap provided; using --xfade and ignoring --gap")
+        if not args.concat:
+            if args.play and parts:
+                print("note: --play with batch (no --concat) will play only the last written clip.")
+                play_file(sorted(parts)[-1])
+            return
 
+        # CONCAT PATH
+        merged_name_base = (
+            args.name if args.name else f"{Path(inputs[0]).stem if inputs else 'highlights'}_highlights"
+        )
+        merged_name = normalize_name(merged_name_base) if args.normalize_names else sanitize_filename(merged_name_base)
+        merged_out = outdir / f"{merged_name}.mp3"
+
+        if args.gap > 0 and args.xfade > 0:
+            print("note: both --xfade and --gap provided; using --xfade and ignoring --gap")
+
+        try:
             if args.xfade > 0 and len(parts) >= 2:
                 ffmpeg_concat_xfade(
-                    parts=parts,
+                    parts=sorted(parts),  # stable order
                     out_path=merged_out,
                     xfade=args.xfade,
                     shape=args.xfade_shape,
@@ -713,14 +949,15 @@ def cmd_run(args):
                     cbr=args.cbr,
                     mono=args.mono,
                     add_limiter=True,
-                    loudnorm_i=(args.loudnorm if args.loudnorm is not None else None)
+                    loudnorm_i=(args.loudnorm if args.loudnorm is not None else None),
+                    copy_meta=args.copy_meta,
                 )
                 print(f"wrote {merged_out}")
             else:
-                # Plain concat via demuxer; optionally insert gaps (silence files)
+                # Plain concat via demuxer; optionally insert gaps
                 if args.gap > 0 and len(parts) >= 2:
                     interleaved: List[Path] = []
-                    for idx, p in enumerate(parts):
+                    for idx, p in enumerate(sorted(parts)):
                         interleaved.append(p)
                         if idx < len(parts) - 1:
                             sfile = tmp_dir / f"silence_{idx:02d}.mp3"
@@ -730,10 +967,9 @@ def cmd_run(args):
 
                 list_file = tmp_dir / "concat.txt"
                 with list_file.open("w", encoding="utf-8") as lf:
-                    for p in parts:
+                    for p in sorted(parts):
                         lf.write(f"file '{p.as_posix()}'\n")
 
-                # Post-filter chain for final (limiter always on; loudnorm optional)
                 filter_chain = ["alimiter=limit=0.90"]
                 if args.loudnorm is not None:
                     filter_chain.append(f"loudnorm=I={args.loudnorm}:TP=-1.5:LRA=11")
@@ -747,7 +983,8 @@ def cmd_run(args):
                     comment=args.info or default_desc,
                     filter_a=filter_a,
                     cbr=args.cbr,
-                    mono=args.mono
+                    mono=args.mono,
+                    copy_meta=args.copy_meta,
                 )
                 print(f"wrote {merged_out}")
 
@@ -755,12 +992,12 @@ def cmd_run(args):
                 clips_dir = outdir / f"{merged_name}_parts"
                 if not DRY_RUN:
                     clips_dir.mkdir(exist_ok=True)
-                for p in tmp_dir.glob("part_*.mp3"):
+                for p in Path(tmp_dir).glob("part_*.mp3"):
                     if DRY_RUN:
                         print(f"DRY-RUN>> keep {p} -> {clips_dir/p.name}")
                     else:
                         p.replace(clips_dir / p.name)
-                for p in tmp_dir.glob("silence_*.mp3"):
+                for p in Path(tmp_dir).glob("silence_*.mp3"):
                     if DRY_RUN:
                         print(f"DRY-RUN>> keep {p} -> {clips_dir/p.name}")
                     else:
@@ -773,19 +1010,17 @@ def cmd_run(args):
         finally:
             if tmp_dir and (not args.keep_clips):
                 if not DRY_RUN:
-                    for p in tmp_dir.glob("*"):
-                        try: p.unlink()
-                        except: pass
-                    try: tmp_dir.rmdir()
-                    except: pass
+                    for p in Path(tmp_dir).glob("*"):
+                        with contextliblib_suppress(): p.unlink()
+                    with contextliblib_suppress(): Path(tmp_dir).rmdir()
         return
 
-    print("error: provide --start and --end for a single clip, or -f/--file for batch/concat, or --parts for existing clips.", file=sys.stderr)
+    print("error: provide --start and --end for a single clip, or -f/--file for batch/concat, or --parts for existing clips.",
+          file=sys.stderr)
     sys.exit(2)
 
 # ---------- Knobs & Friendly subcommands ----------
 
-# knobs are reusable bundles of flags injected before user args
 def _cfg_knobs(cfg: dict) -> Dict[str, List[str]]:
     return cfg.setdefault("knobs", {})
 
@@ -816,11 +1051,18 @@ def cmd_cut(args):
     if args.copy: argv += ["--copy"]
     if args.play: argv += ["--play"]
     if args.mono: argv += ["--mono"]
-    if args.cbr:  argv += ["--cbr", args.cbr]
+    if args.cbr: argv += ["--cbr", args.cbr]
     if args.edge_fade is not None: argv += ["--edge-fade", str(args.edge_fade)]
-    if args.xfade is not None: argv += ["--xfade", str(args.xfade)]  # allow inline xfade choice
-    if args.gap   is not None: argv += ["--gap", str(args.gap)]
+    if args.xfade is not None: argv += ["--xfade", str(args.xfade)]
+    if args.gap is not None: argv += ["--gap", str(args.gap)]
     if args.loudnorm is not None: argv += ["--loudnorm", str(args.loudnorm)]
+    if args.pad_start is not None: argv += ["--pad-start", str(args.pad_start)]
+    if args.pad_end is not None: argv += ["--pad-end", str(args.pad_end)]
+    if args.trim_silence: argv += ["--trim-silence"]
+    if args.copy_meta: argv += ["--copy-meta"]
+    if args.prefix: argv += ["--prefix", args.prefix]
+    if args.suffix: argv += ["--suffix", args.suffix]
+    if args.normalize_names: argv += ["--normalize-names"]
     argv = _apply_knob_argv(argv, args.knob)
     return _dispatch_to_run(argv)
 
@@ -833,10 +1075,19 @@ def cmd_batch(args):
     if args.info: argv += ["--info", args.info]
     if args.keep_clips: argv += ["--keep-clips"]
     if args.mono: argv += ["--mono"]
-    if args.cbr:  argv += ["--cbr", args.cbr]
+    if args.cbr: argv += ["--cbr", args.cbr]
     if args.xfade is not None: argv += ["--xfade", str(args.xfade)]
-    if args.gap   is not None: argv += ["--gap", str(args.gap)]
+    if args.gap is not None: argv += ["--gap", str(args.gap)]
     if args.loudnorm is not None: argv += ["--loudnorm", str(args.loudnorm)]
+    if args.pad_start is not None: argv += ["--pad-start", str(args.pad_start)]
+    if args.pad_end is not None: argv += ["--pad-end", str(args.pad_end)]
+    if args.trim_silence: argv += ["--trim-silence"]
+    if args.copy_meta: argv += ["--copy-meta"]
+    if args.prefix: argv += ["--prefix", args.prefix]
+    if args.suffix: argv += ["--suffix", args.suffix]
+    if args.normalize_names: argv += ["--normalize-names"]
+    if args.jobs: argv += ["--jobs", str(args.jobs)]
+    if args.strict: argv += ["--strict"]
     argv = _apply_knob_argv(argv, args.knob)
     return _dispatch_to_run(argv)
 
@@ -848,10 +1099,12 @@ def cmd_join(args):
     if args.info: argv += ["--info", args.info]
     if args.play: argv += ["--play"]
     if args.mono: argv += ["--mono"]
-    if args.cbr:  argv += ["--cbr", args.cbr]
+    if args.cbr: argv += ["--cbr", args.cbr]
     if args.xfade is not None: argv += ["--xfade", str(args.xfade)]
-    if args.gap   is not None: argv += ["--gap", str(args.gap)]
+    if args.gap is not None: argv += ["--gap", str(args.gap)]
     if args.loudnorm is not None: argv += ["--loudnorm", str(args.loudnorm)]
+    if args.copy_meta: argv += ["--copy-meta"]
+    if args.normalize_names: argv += ["--normalize-names"]
     argv = _apply_knob_argv(argv, args.knob)
     return _dispatch_to_run(argv)
 
@@ -859,27 +1112,27 @@ def cmd_ez(args):
     print("Welcome to clipex ez — quick setup\n")
     mode = (input("Mode [cut/batch/join] (default: cut): ").strip() or "cut").lower()
     out = input("Output directory (Enter to use defaults): ").strip()
-    out_argv = (["-o", out] if out else [])
+    out_argv = ["-o", out] if out else []
 
     if mode == "cut":
         inp = input("Input MP3 path: ").strip()
-        st  = input("Start time (e.g., 3:55.250): ").strip()
-        en  = input("End time: ").strip()
-        name= input("Clip name (optional): ").strip()
+        st = input("Start time (e.g., 3:55.250): ").strip()
+        en = input("End time: ").strip()
+        name = input("Clip name (optional): ").strip()
         argv = out_argv + ["-i", inp, "--start", st, "--end", en]
         if name: argv += ["--name", name]
         return _dispatch_to_run(argv)
 
     if mode == "batch":
         inp = input("Input MP3 path (or first source used in CSV): ").strip()
-        csvp= input("CSV path: ").strip()
-        join= (input("Join into one file? [y/N]: ").strip().lower() == "y")
+        csvp = input("CSV path: ").strip()
+        join = input("Join into one file? [y/N]: ").strip().lower() == "y"
         argv = out_argv + ["-i", inp, "-f", csvp] + (["--concat"] if join else [])
         return _dispatch_to_run(argv)
 
     if mode == "join":
         parts = input("Space-separated part files: ").strip().split()
-        name  = input("Merged name (optional): ").strip()
+        name = input("Merged name (optional): ").strip()
         argv = out_argv + ["--parts"] + parts + ["--concat"]
         if name: argv += ["--name", name]
         return _dispatch_to_run(argv)
@@ -901,7 +1154,8 @@ def cmd_knob(args):
 
     if args.action == "save":
         if not args.name:
-            print("error: knob save requires a NAME", file=sys.stderr); return 2
+            print("error: knob save requires a NAME", file=sys.stderr)
+            return 2
         knobs[args.name] = args.flags or []
         _save_knobs(cfg)
         print(f"saved knob '{args.name}': {' '.join(knobs[args.name])}")
@@ -909,24 +1163,29 @@ def cmd_knob(args):
 
     if args.action == "apply":
         if not args.name:
-            print("error: knob apply requires a NAME", file=sys.stderr); return 2
+            print("error: knob apply requires a NAME", file=sys.stderr)
+            return 2
         flags = knobs.get(args.name)
         if not flags:
-            print(f"error: knob '{args.name}' not found", file=sys.stderr); return 2
+            print(f"error: knob '{args.name}' not found", file=sys.stderr)
+            return 2
         print(f"apply knob '{args.name}': {' '.join(flags)}")
         return 0
 
     if args.action == "delete":
         if not args.name:
-            print("error: knob delete requires a NAME", file=sys.stderr); return 2
+            print("error: knob delete requires a NAME", file=sys.stderr)
+            return 2
         if args.name in knobs:
             del knobs[args.name]
             _save_knobs(cfg)
             print(f"deleted knob '{args.name}'")
             return 0
-        print(f"error: knob '{args.name}' not found", file=sys.stderr); return 2
+        print(f"error: knob '{args.name}' not found", file=sys.stderr)
+        return 2
 
-    print("error: unknown knob action", file=sys.stderr); return 2
+    print("error: unknown knob action", file=sys.stderr)
+    return 2
 
 # ---------- Shell completion printer ----------
 
@@ -935,9 +1194,9 @@ _clipex_complete() {
   local cur prev words cword
   _init_completion || return
   case "${COMP_WORDS[1]}" in
-    cut)   COMPREPLY=( $(compgen -W "--edge-fade --mono --cbr --copy --play -o --output -n --name --info --xfade --gap --loudnorm --knob" -- "$cur") );;
-    batch) COMPREPLY=( $(compgen -W "--join --keep-clips --xfade --gap --loudnorm --mono --cbr -o --output -n --name --info --knob" -- "$cur") );;
-    join)  COMPREPLY=( $(compgen -W "--xfade --gap --loudnorm --mono --cbr --play -o --output -n --name --info --knob" -- "$cur") );;
+    cut)   COMPREPLY=( $(compgen -W "--edge-fade --mono --cbr --copy --copy-meta --play -o --output -n --name --info --xfade --gap --loudnorm --pad-start --pad-end --trim-silence --silence-threshold --silence-min --prefix --suffix --normalize-names --knob" -- "$cur") );;
+    batch) COMPREPLY=( $(compgen -W "--join --keep-clips --xfade --gap --loudnorm --mono --cbr -o --output -n --name --info --pad-start --pad-end --trim-silence --silence-threshold --silence-min --copy-meta --prefix --suffix --normalize-names --jobs --strict --knob" -- "$cur") );;
+    join)  COMPREPLY=( $(compgen -W "--xfade --gap --loudnorm --mono --cbr --copy-meta --play -o --output -n --name --info --normalize-names --knob" -- "$cur") );;
     space) COMPREPLY=( $(compgen -W "create start change end set list delete" -- "$cur") );;
     knob)  COMPREPLY=( $(compgen -W "save list apply delete" -- "$cur") );;
     *)     COMPREPLY=( $(compgen -W "run set help space cut batch join ez knob gen-completion --examples --version --verbose -v --yes -y --progress --dry-run" -- "$cur") );;
@@ -948,7 +1207,6 @@ complete -F _clipex_complete clipex
 
 ZSH_COMPLETION = r"""# zsh completion for clipex
 # add to fpath and compinit
-# basic, no external deps
 #compdef clipex
 _arguments \
   '1:command:(run set help space cut batch join ez knob gen-completion)' \
@@ -957,13 +1215,13 @@ _arguments \
 _clipex_opts() {
   case $words[2] in
     cut)
-      _values 'options' --edge-fade --mono --cbr --copy --play -o --output -n --name --info --xfade --gap --loudnorm --knob
+      _values 'options' --edge-fade --mono --cbr --copy --copy-meta --play -o --output -n --name --info --xfade --gap --loudnorm --pad-start --pad-end --trim-silence --silence-threshold --silence-min --prefix --suffix --normalize-names --knob
       ;;
     batch)
-      _values 'options' --join --keep-clips --xfade --gap --loudnorm --mono --cbr -o --output -n --name --info --knob
+      _values 'options' --join --keep-clips --xfade --gap --loudnorm --mono --cbr -o --output -n --name --info --pad-start --pad-end --trim-silence --silence-threshold --silence-min --copy-meta --prefix --suffix --normalize-names --jobs --strict --knob
       ;;
     join)
-      _values 'options' --xfade --gap --loudnorm --mono --cbr --play -o --output -n --name --info --knob
+      _values 'options' --xfade --gap --loudnorm --mono --cbr --copy-meta --play -o --output -n --name --info --normalize-names --knob
       ;;
     space)
       _values 'options' create start change end set list delete
@@ -999,9 +1257,11 @@ def cmd_space(args):
     if args.action == "create":
         name = args.name
         if not name:
-            print("error: space create requires a NAME", file=sys.stderr); sys.exit(2)
+            print("error: space create requires a NAME", file=sys.stderr)
+            sys.exit(2)
         if name in spaces:
-            print(f"error: space '{name}' already exists", file=sys.stderr); sys.exit(2)
+            print(f"error: space '{name}' already exists", file=sys.stderr)
+            sys.exit(2)
         spaces[name] = {"in": "", "out": ""}
         save_config(cfg)
         print(f"created space '{name}'")
@@ -1009,9 +1269,11 @@ def cmd_space(args):
     elif args.action in {"start", "change"}:
         name = args.name
         if not name:
-            print(f"error: space {args.action} requires a NAME", file=sys.stderr); sys.exit(2)
+            print(f"error: space {args.action} requires a NAME", file=sys.stderr)
+            sys.exit(2)
         if name not in spaces:
-            print(f"error: space '{name}' not found", file=sys.stderr); sys.exit(2)
+            print(f"error: space '{name}' not found", file=sys.stderr)
+            sys.exit(2)
         set_current_space(cfg, name)
         print(f"current space: {name}")
 
@@ -1019,22 +1281,23 @@ def cmd_space(args):
         name = args.name
         cur = get_current_space(cfg)
         if name and name != cur:
-            print(f"error: space '{name}' is not the current space (current is '{cur}')", file=sys.stderr); sys.exit(2)
+            print(f"error: space '{name}' is not the current space (current is '{cur}')", file=sys.stderr)
+            sys.exit(2)
         set_current_space(cfg, None)
         print("cleared current space")
 
     elif args.action == "set":
         cur = get_current_space(cfg)
         if not cur:
-            print("error: no current space. Use 'clipex space start NAME' first.", file=sys.stderr); sys.exit(2)
+            print("error: no current space. Use 'clipex space start NAME' first.",
+                  file=sys.stderr)
+            sys.exit(2)
         sp = spaces.setdefault(cur, {"in": "", "out": ""})
         changed = False
         if args.in_dir:
-            sp["in"] = str(Path(args.in_dir).expanduser())
-            changed = True
+            sp["in"] = str(Path(args.in_dir).expanduser()); changed = True
         if args.out_dir:
-            sp["out"] = str(Path(args.out_dir).expanduser())
-            changed = True
+            sp["out"] = str(Path(args.out_dir).expanduser()); changed = True
         if changed:
             save_config(cfg)
             print(f"updated space '{cur}': in={sp.get('in') or '(unset)'} out={sp.get('out') or '(unset)'}")
@@ -1058,9 +1321,11 @@ def cmd_space(args):
     elif args.action == "delete":
         name = args.name
         if not name:
-            print("error: space delete requires a NAME", file=sys.stderr); sys.exit(2)
+            print("error: space delete requires a NAME", file=sys.stderr)
+            sys.exit(2)
         if name not in spaces:
-            print(f"error: space '{name}' not found", file=sys.stderr); sys.exit(2)
+            print(f"error: space '{name}' not found", file=sys.stderr)
+            sys.exit(2)
         if get_current_space(cfg) == name:
             set_current_space(cfg, None)
         spaces.pop(name, None)
@@ -1068,7 +1333,8 @@ def cmd_space(args):
         print(f"deleted space '{name}'")
 
     else:
-        print("error: unknown space action", file=sys.stderr); sys.exit(2)
+        print("error: unknown space action", file=sys.stderr)
+        sys.exit(2)
 
 # ---------- CLI ----------
 
@@ -1077,27 +1343,28 @@ def make_parser() -> argparse.ArgumentParser:
         prog=APP_NAME,
         description=APP_DESC,
         formatter_class=_SmartFormatter,
-        epilog=_dedent("""\
+        epilog=_dedent(
+            """\
             Tips:
               • Times accept M:SS(.ms), H:MM:SS(.ms), or raw seconds(.ms).
-              • Use --copy for speed when you don't need fades/filters/mono/CBR.
+              • Use --copy for speed when you don't need fades/filters/mono/CBR/trim-silence.
               • CSV '#default, text...' sets a default description for empty/#default rows.
               • With --concat, prefer --xfade for smooth transitions or --gap for separation.
-              • You can pass multiple -i/--input, and/or use a per-row 'source' in CSV.
-              • Or skip cutting entirely with --parts to merge existing clips.
-              • Use 'clipex space' to organize input/output defaults per project.
-              • Use 'clipex knob' to save and reuse your favorite flag sets.
-              • Try --dry-run to preview what will happen.
-            """),
-        add_help=False
+              • Per-row 'source' can point to different files; also supports multiple -i.
+              • 'spaces' remember your in/out roots; 'knobs' save favorite flags.
+              • --jobs parallelizes batch cutting. Use --strict to fail fast.
+              • --dry-run previews ffmpeg commands without writing files.
+            """
+        ),
+        add_help=False,
     )
 
     # Global flags
-    p.add_argument("-h","--help", action="help", help="Show this help message and exit")
+    p.add_argument("-h", "--help", action="help", help="Show this help message and exit")
     p.add_argument("--version", action="version", version=f"%(prog)s {APP_VER}", help="Show version and exit")
     p.add_argument("--examples", action="store_true", help="Print practical usage recipes and exit")
-    p.add_argument("-y","--yes", action="store_true", help="Overwrite output files without asking (passes -y to ffmpeg)")
-    p.add_argument("-v","--verbose", action="store_true", help="Verbose output (show ffmpeg commands, list space I/O)")
+    p.add_argument("-y", "--yes", action="store_true", help="Overwrite output files without asking (passes -y to ffmpeg)")
+    p.add_argument("-v", "--verbose", action="store_true", help="Verbose output (show ffmpeg commands, list space I/O)")
     p.add_argument("--progress", action="store_true", help="Show ffmpeg progress (-stats)")
     p.add_argument("--dry-run", action="store_true", help="Print what would happen without executing")
 
@@ -1105,64 +1372,75 @@ def make_parser() -> argparse.ArgumentParser:
 
     # ---- run ----
     pr = sub.add_parser(
-        "run", help="Run clipex (default)", formatter_class=_SmartFormatter, add_help=False,
-        description=_dedent("""\
+        "run",
+        help="Run clipex (default)",
+        formatter_class=_SmartFormatter,
+        add_help=False,
+        description=_dedent(
+            """\
             Run clipex to cut clips from MP3s.
             Modes:
               • Single clip:   --start + --end (outputs one file, requires exactly one -i)
               • Batch:         -f/--file CSV (outputs many files)
               • Concat:        --concat on a batch (one highlight reel)
               • Parts concat:  --parts (skip cutting; just merge existing clips)
-            """)
+            """
+        ),
     )
-    pr.add_argument("-h","--help", action="help", help="Show help for 'run' and exit")
+    pr.add_argument("-h", "--help", action="help", help="Show help for 'run' and exit")
     pr.add_argument("--examples", action="store_true", help="Show 'run' examples and exit")
 
     # IO
-    pr.add_argument("-i","--input", metavar="FILE", action="append",
+    pr.add_argument("-i", "--input", metavar="FILE", action="append",
                     help="Input MP3 file. Can be given multiple times; rows without a 'source' column use the first. Resolved against current space's 'in' if set.")
-    pr.add_argument("-o","--output", metavar="DIR", help="Output directory (falls back to current space's 'out', then global default)")
+    pr.add_argument("-o", "--output", metavar="DIR", help="Output directory (falls back to current space's 'out', then global default)")
 
     pr.add_argument("--name", metavar="NAME", help="Output file name (single clip) or merged name with --concat")
     pr.add_argument("--info", metavar="TEXT", help="Optional description/notes for metadata")
-    pr.add_argument("-f","--file", metavar="CSV",
-                    help=_dedent("""\
-                        Batch CSV with rows: start,end,name,description[,source]
-                        Header is optional (auto-detected). Lines starting with '#default' set
-                        a default description for rows that use '#default' or empty description.
-                        'source' (optional per row) can reference a different input file for that clip
-                        and will be resolved against the current space's 'in' if set.
-                        Times support milliseconds: M:SS(.ms), H:MM:SS(.ms), or seconds(.ms)
-                    """))
-    pr.add_argument("--parts", nargs="+", metavar="MP3",
-                    help="Existing clip files to concat (skip cutting). Incompatible with --start/--end and -f/--file.")
+    pr.add_argument("-f", "--file", metavar="CSV", help=_dedent("""\
+        Batch CSV with rows: start,end,name,description[,source]
+        Header is optional. '#default, text...' sets a default description.
+        'source' (optional per row) can reference a different input file.
+        Times support ms: M:SS(.ms), H:MM:SS(.ms), or seconds(.ms)
+    """))
+    pr.add_argument("--parts", nargs="+", metavar="MP3", help="Existing clip files to concat (skip cutting). Incompatible with --start/--end and -f/--file.")
 
     # Single-clip selection
     pr.add_argument("--start", metavar="TIME", help="Start time (M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
-    pr.add_argument("--end",   metavar="TIME", help="End time (M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
+    pr.add_argument("--end", metavar="TIME", help="End time (M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))")
 
     # Performance/accuracy
-    pr.add_argument("--copy", action="store_true",
-                    help="Try stream copy (fast, less accurate; disabled if filters/mono/CBR are used)")
+    pr.add_argument("--copy", action="store_true", help="Try stream copy (fast; disabled if filters/mono/CBR/trim-silence are used)")
 
     # Concat controls
     pr.add_argument("--concat", action="store_true", help="Concatenate all batch clips into one MP3")
     pr.add_argument("--keep-clips", action="store_true", help="With --concat, keep the intermediate cut parts")
 
     # Audio shaping
-    pr.add_argument("--xfade", type=float, default=1.0,
-                    help="Crossfade seconds between clips (with --concat). Set 0 to disable.")
-    pr.add_argument("--xfade-shape", choices=["tri","log","exp","qsin"], default="tri",
-                    help="Crossfade curve shape")
-    pr.add_argument("--gap", type=float, default=0.0,
-                    help="Silence (seconds) inserted between clips when not using --xfade")
-    pr.add_argument("--edge-fade", type=float, default=0.02,
-                    help="Tiny fade at start/end of each cut part to prevent clicks")
-    pr.add_argument("--loudnorm", type=float, default=None,
-                    help="Target LUFS for final loudness (e.g., -16 for podcasts). Re-encodes final.")
+    pr.add_argument("--xfade", type=float, default=1.0, help="Crossfade seconds between clips (with --concat). Set 0 to disable.")
+    pr.add_argument("--xfade-shape", choices=["tri", "log", "exp", "qsin"], default="tri", help="Crossfade curve shape")
+    pr.add_argument("--gap", type=float, default=0.0, help="Silence (seconds) inserted between clips when not using --xfade")
+    pr.add_argument("--edge-fade", type=float, default=0.02, help="Tiny fade at start/end of each cut part to prevent clicks")
+    pr.add_argument("--loudnorm", type=float, default=None, help="Target LUFS for final loudness (e.g., -16 for podcasts). Re-encodes final.")
     pr.add_argument("--mono", action="store_true", help="Downmix the final output to mono")
-    pr.add_argument("--cbr", type=str, default=None, metavar="RATE",
-                    help="Force constant bitrate for encoding (e.g., 192k). Default is VBR -q:a 2.")
+    pr.add_argument("--cbr", type=str, default=None, metavar="RATE", help="Force constant bitrate for encoding (e.g., 192k). Default is VBR -q:a 2.")
+    pr.add_argument("--copy-meta", action="store_true", help="Copy metadata from the source (-map_metadata 0)")
+
+    # Extra shaping helpers
+    pr.add_argument("--pad-start", type=float, default=0.0, help="Pad this many seconds before the start")
+    pr.add_argument("--pad-end", type=float, default=0.0, help="Pad this many seconds after the end")
+    pr.add_argument("--trim-silence", action="store_true", help="Trim leading/trailing silence on each cut (silenceremove)")
+    pr.add_argument("--silence-threshold", type=float, default=-50.0, help="Silence threshold in dB for trim-silence (negative; e.g., -50)")
+    pr.add_argument("--silence-min", type=float, default=0.02, help="Min duration (seconds) considered silence")
+
+    # Naming helpers
+    pr.add_argument("--prefix", type=str, help="Prefix for output filenames")
+    pr.add_argument("--suffix", type=str, help="Suffix for output filenames (before extension)")
+    pr.add_argument("--normalize-names", action="store_true", help="Normalize names: lowercase, spaces->_, ASCII-safe")
+
+    # Batch behavior
+    pr.add_argument("--jobs", type=int, default=1, help="Parallel cuts for batch mode (default: 1)")
+    pr.add_argument("--strict", action="store_true", help="Fail fast on first error in batch mode")
 
     # UX niceties
     pr.add_argument("--play", action="store_true", help="Play the resulting clip/output after writing it")
@@ -1170,18 +1448,17 @@ def make_parser() -> argparse.ArgumentParser:
     pr.set_defaults(func=cmd_run)
 
     # ---- set ----
-    ps = sub.add_parser(
-        "set", help="Set global defaults", formatter_class=_SmartFormatter, add_help=False,
-        description=f"Configure persistent defaults (stored under {CONFIG_PATH})."
-    )
-    ps.add_argument("-h","--help", action="help", help="Show help for 'set' and exit")
-    ps.add_argument("--output-default", metavar="DIR", help="Default output directory for all runs (used when space 'out' and --output are not set)")
+    ps = sub.add_parser("set", help="Set global defaults",
+                        formatter_class=_SmartFormatter, add_help=False,
+                        description=f"Configure persistent defaults (stored under {CONFIG_PATH}).")
+    ps.add_argument("-h", "--help", action="help", help="Show help for 'set' and exit")
+    ps.add_argument("--output-default", metavar="DIR", help="Default output directory when not otherwise set")
     ps.set_defaults(func=cmd_set)
 
     # ---- space ----
-    pspace = sub.add_parser(
-        "space", help="Manage named spaces (namespaces) for I/O presets", add_help=False, formatter_class=_SmartFormatter,
-        description=_dedent("""\
+    pspace = sub.add_parser("space", help="Manage named spaces (namespaces) for I/O presets",
+                            add_help=False, formatter_class=_SmartFormatter,
+                            description=_dedent("""\
             Work with project 'spaces' (namespaces) that remember input/output directories.
             Actions:
               • create NAME        Create a space
@@ -1190,22 +1467,18 @@ def make_parser() -> argparse.ArgumentParser:
               • set [--in DIR] [--out DIR] [--list-io]   Update/list current space I/O
               • list               List spaces (current one is marked with *)
               • delete NAME        Remove a space
-        """)
-    )
-    pspace.add_argument("-h","--help", action="help", help="Show help for 'space' and exit")
+        """))
+    pspace.add_argument("-h", "--help", action="help", help="Show help for 'space' and exit")
     space_sub = pspace.add_subparsers(dest="action", metavar="ACTION")
 
     sp_create = space_sub.add_parser("create", help="Create a space", add_help=False)
-    sp_create.add_argument("name", help="Space name")
-    sp_create.set_defaults(func=cmd_space)
+    sp_create.add_argument("name", help="Space name"); sp_create.set_defaults(func=cmd_space)
 
     sp_start = space_sub.add_parser("start", help="Start/use a space", add_help=False)
-    sp_start.add_argument("name", help="Space name")
-    sp_start.set_defaults(func=cmd_space)
+    sp_start.add_argument("name", help="Space name"); sp_start.set_defaults(func=cmd_space)
 
     sp_change = space_sub.add_parser("change", help="Alias of start", add_help=False)
-    sp_change.add_argument("name", help="Space name")
-    sp_change.set_defaults(func=cmd_space)
+    sp_change.add_argument("name", help="Space name"); sp_change.set_defaults(func=cmd_space)
 
     sp_end = space_sub.add_parser("end", help="Clear current space", add_help=False)
     sp_end.add_argument("name", nargs="?", help="(optional) Must match current space if provided")
@@ -1217,92 +1490,114 @@ def make_parser() -> argparse.ArgumentParser:
     sp_set.add_argument("--list-io", action="store_true", help="List current space I/O")
     sp_set.set_defaults(func=cmd_space)
 
-    sp_list = space_sub.add_parser("list", help="List spaces", add_help=False)
-    sp_list.set_defaults(func=cmd_space)
+    sp_list = space_sub.add_parser("list", help="List spaces", add_help=False); sp_list.set_defaults(func=cmd_space)
 
     sp_delete = space_sub.add_parser("delete", help="Delete a space", add_help=False)
-    sp_delete.add_argument("name", help="Space name")
-    sp_delete.set_defaults(func=cmd_space)
+    sp_delete.add_argument("name", help="Space name"); sp_delete.set_defaults(func=cmd_space)
 
     # ---- help (topic-aware) ----
-    ph = sub.add_parser(
-        "help", help="Show top-level help or topic help (run | set | space)",
-        formatter_class=_SmartFormatter, add_help=False
-    )
-    ph.add_argument("-h","--help", action="help", help="Show help for 'help' and exit")
+    ph = sub.add_parser("help", help="Show top-level help or topic help (run | set | space)",
+                        formatter_class=_SmartFormatter, add_help=False)
+    ph.add_argument("-h", "--help", action="help", help="Show help for 'help' and exit")
     ph.add_argument("topic", nargs="?", help="Help topic: run | set | space")
     ph.set_defaults(func=lambda a: print_topic_help_and_exit(p, a.topic))
 
     # >>> Friendly subcommands
 
     # cut
-    pcut = sub.add_parser("cut", help="Easy single clip", formatter_class=_SmartFormatter, add_help=False)
-    pcut.add_argument("-h","--help", action="help", help="Show help for 'cut' and exit")
+    pcut = sub.add_parser("cut", help="Easy single clip",
+                          formatter_class=_SmartFormatter, add_help=False)
+    pcut.add_argument("-h", "--help", action="help", help="Show help for 'cut' and exit")
     pcut.add_argument("input", help="Input MP3")
     pcut.add_argument("start", help="Start time (M:SS(.ms) | H:MM:SS(.ms) | seconds(.ms))")
-    pcut.add_argument("end",   help="End time")
-    pcut.add_argument("-n","--name", help="Output name")
+    pcut.add_argument("end", help="End time")
+    pcut.add_argument("-n", "--name", help="Output name")
     pcut.add_argument("--info", help="Metadata comment/notes")
-    pcut.add_argument("-o","--output", help="Output directory")
+    pcut.add_argument("-o", "--output", help="Output directory")
     pcut.add_argument("--edge-fade", type=float, default=None, help="Tiny fades (seconds) at clip edges")
     pcut.add_argument("--mono", action="store_true")
-    pcut.add_argument("--cbr",  metavar="RATE")
+    pcut.add_argument("--cbr", metavar="RATE")
     pcut.add_argument("--copy", action="store_true")
+    pcut.add_argument("--copy-meta", action="store_true")
     pcut.add_argument("--play", action="store_true")
-    pcut.add_argument("--xfade", type=float, help="Optional crossfade default when later joining this clip")
-    pcut.add_argument("--gap",   type=float, help="Optional gap default when later joining this clip")
-    pcut.add_argument("--loudnorm", type=float, help="Optional loudness default when later joining this clip")
+    pcut.add_argument("--xfade", type=float, help="Optional crossfade default when later joining")
+    pcut.add_argument("--gap", type=float, help="Optional gap default when later joining")
+    pcut.add_argument("--loudnorm", type=float, help="Optional loudness default when later joining")
+    pcut.add_argument("--pad-start", type=float, help="Pad seconds before start")
+    pcut.add_argument("--pad-end", type=float, help="Pad seconds after end")
+    pcut.add_argument("--trim-silence", action="store_true")
+    pcut.add_argument("--silence-threshold", type=float, help="Trim threshold dB")
+    pcut.add_argument("--silence-min", type=float, help="Trim min silence seconds")
+    pcut.add_argument("--prefix", help="Filename prefix")
+    pcut.add_argument("--suffix", help="Filename suffix")
+    pcut.add_argument("--normalize-names", action="store_true")
     pcut.add_argument("--knob", help="Apply a saved knob (adds its flags first)")
     pcut.set_defaults(func=cmd_cut)
 
     # batch
-    pbat = sub.add_parser("batch", help="Easy batch CSV mode (with optional join)", formatter_class=_SmartFormatter, add_help=False)
-    pbat.add_argument("-h","--help", action="help", help="Show help for 'batch' and exit")
+    pbat = sub.add_parser("batch", help="Easy batch CSV mode (with optional join)",
+                          formatter_class=_SmartFormatter, add_help=False)
+    pbat.add_argument("-h", "--help", action="help", help="Show help for 'batch' and exit")
     pbat.add_argument("input", help="Input MP3 (rows without 'source' use this)")
-    pbat.add_argument("csv",   help="CSV file with start,end,name,description[,source]")
-    pbat.add_argument("-o","--output", help="Output directory")
+    pbat.add_argument("csv", help="CSV with start,end,name,description[,source]")
+    pbat.add_argument("-o", "--output", help="Output directory")
     pbat.add_argument("--join", action="store_true", help="Concatenate all clips into one file")
-    pbat.add_argument("-n","--name", help="Merged output name when --join is used")
+    pbat.add_argument("-n", "--name", help="Merged output name when --join is used")
     pbat.add_argument("--info", help="Metadata comment/notes")
     pbat.add_argument("--xfade", type=float, help="Crossfade seconds (join mode)")
-    pbat.add_argument("--gap",   type=float, help="Silence seconds between clips (no xfade)")
+    pbat.add_argument("--gap", type=float, help="Silence seconds between clips (no xfade)")
     pbat.add_argument("--loudnorm", type=float, help="Target LUFS for final")
     pbat.add_argument("--mono", action="store_true")
-    pbat.add_argument("--cbr",  metavar="RATE")
+    pbat.add_argument("--cbr", metavar="RATE")
     pbat.add_argument("--keep-clips", action="store_true")
+    pbat.add_argument("--pad-start", type=float, help="Pad seconds before each start")
+    pbat.add_argument("--pad-end", type=float, help="Pad seconds after each end")
+    pbat.add_argument("--trim-silence", action="store_true")
+    pbat.add_argument("--silence-threshold", type=float)
+    pbat.add_argument("--silence-min", type=float)
+    pbat.add_argument("--copy-meta", action="store_true")
+    pbat.add_argument("--prefix", help="Filename prefix")
+    pbat.add_argument("--suffix", help="Filename suffix")
+    pbat.add_argument("--normalize-names", action="store_true")
+    pbat.add_argument("--jobs", type=int, help="Parallel cuts")
+    pbat.add_argument("--strict", action="store_true", help="Fail fast on first error")
     pbat.add_argument("--knob", help="Apply a saved knob")
     pbat.set_defaults(func=cmd_batch)
 
     # join
-    pjoin = sub.add_parser("join", help="Easy join for existing clips", formatter_class=_SmartFormatter, add_help=False)
-    pjoin.add_argument("-h","--help", action="help", help="Show help for 'join' and exit")
+    pjoin = sub.add_parser("join", help="Easy join for existing clips",
+                           formatter_class=_SmartFormatter, add_help=False)
+    pjoin.add_argument("-h", "--help", action="help", help="Show help for 'join' and exit")
     pjoin.add_argument("parts", nargs="+", help="List of existing MP3 clip files")
-    pjoin.add_argument("-o","--output", help="Output directory")
-    pjoin.add_argument("-n","--name", help="Merged output name")
+    pjoin.add_argument("-o", "--output", help="Output directory")
+    pjoin.add_argument("-n", "--name", help="Merged output name")
     pjoin.add_argument("--info", help="Metadata comment/notes")
     pjoin.add_argument("--xfade", type=float, help="Crossfade seconds")
-    pjoin.add_argument("--gap",   type=float, help="Silence seconds if not using xfade")
+    pjoin.add_argument("--gap", type=float, help="Silence seconds if not using xfade")
     pjoin.add_argument("--loudnorm", type=float, help="Target LUFS for final")
     pjoin.add_argument("--mono", action="store_true")
-    pjoin.add_argument("--cbr",  metavar="RATE")
+    pjoin.add_argument("--cbr", metavar="RATE")
+    pjoin.add_argument("--copy-meta", action="store_true")
     pjoin.add_argument("--play", action="store_true")
+    pjoin.add_argument("--normalize-names", action="store_true")
     pjoin.add_argument("--knob", help="Apply a saved knob")
     pjoin.set_defaults(func=cmd_join)
 
     # ez
-    pez = sub.add_parser("ez", help="Interactive wizard (no flags needed)", formatter_class=_SmartFormatter, add_help=False)
-    pez.add_argument("-h","--help", action="help", help="Show help for 'ez' and exit")
+    pez = sub.add_parser("ez", help="Interactive wizard (no flags needed)",
+                         formatter_class=_SmartFormatter, add_help=False)
+    pez.add_argument("-h", "--help", action="help", help="Show help for 'ez' and exit")
     pez.set_defaults(func=cmd_ez)
 
     # knob manager
-    pk = sub.add_parser("knob", help="Manage reusable flag bundles", formatter_class=_SmartFormatter, add_help=False)
-    pk.add_argument("-h","--help", action="help", help="Show help for 'knob' and exit")
+    pk = sub.add_parser("knob", help="Manage reusable flag bundles",
+                        formatter_class=_SmartFormatter, add_help=False)
+    pk.add_argument("-h", "--help", action="help", help="Show help for 'knob' and exit")
     pks = pk.add_subparsers(dest="action", metavar="ACTION")
 
     pk_save = pks.add_parser("save", help="Save a knob", add_help=False)
     pk_save.add_argument("name")
-    pk_save.add_argument("flags", nargs=argparse.REMAINDER,
-                         help="Flags to store (e.g. --xfade 1.0 --loudnorm -16 --mono)")
+    pk_save.add_argument("flags", nargs=argparse.REMAINDER, help="Flags to store (e.g. --xfade 1.0 --loudnorm -16 --mono)")
     pk_save.set_defaults(func=cmd_knob)
 
     pk_list = pks.add_parser("list", help="List knobs", add_help=False)
@@ -1317,24 +1612,32 @@ def make_parser() -> argparse.ArgumentParser:
     pk_del.set_defaults(func=cmd_knob)
 
     # completion
-    pc = sub.add_parser("gen-completion", help="Print bash/zsh completion script", formatter_class=_SmartFormatter, add_help=False)
-    pc.add_argument("-h","--help", action="help", help="Show help for 'gen-completion' and exit")
-    pc.add_argument("--shell", choices=["bash","zsh"], help="Shell type")
+    pc = sub.add_parser("gen-completion", help="Print bash/zsh completion script",
+                        formatter_class=_SmartFormatter, add_help=False)
+    pc.add_argument("-h", "--help", action="help", help="Show help for 'gen-completion' and exit")
+    pc.add_argument("--shell", choices=["bash", "zsh"], help="Shell type")
     pc.set_defaults(func=cmd_gen_completion)
 
     return p
+
+# Safe suppress helper for cleanup
+class contextliblib_suppress:
+    def __enter__(self): return self
+    def __exit__(self, *exc): return True
 
 def main(argv=None):
     global VERBOSE, OVERWRITE, PROGRESS, DRY_RUN
     argv = sys.argv[1:] if argv is None else argv
     parser = make_parser()
 
-    # Global --examples works from anywhere (before we potentially dispatch to subcommands)
+    # Global --examples works from anywhere
     if "--examples" in argv and (len(argv) == 1 or argv[0] != "help"):
         print_examples_and_exit()
 
     # Convenience: if first token isn't a subcommand, treat as 'run'
-    if argv and argv[0] not in {"run","set","help","space","cut","batch","join","ez","knob","gen-completion"}:
+    if argv and argv[0] not in {
+        "run","set","help","space","cut","batch","join","ez","knob","gen-completion",
+    }:
         argv = ["run"] + argv
 
     args = parser.parse_args(argv)
@@ -1343,13 +1646,15 @@ def main(argv=None):
     VERBOSE = bool(getattr(args, "verbose", False))
     OVERWRITE = bool(getattr(args, "yes", False))
     PROGRESS = bool(getattr(args, "progress", False))
-    DRY_RUN  = bool(getattr(args, "dry_run", False))
+    DRY_RUN = bool(getattr(args, "dry_run", False))
 
-    # 'help' subcommand already exits; others continue
     if not hasattr(args, "func"):
         parser.print_help()
         return 2
     try:
+        # quick ffmpeg sanity for actions that will execute it
+        if args.cmd in {"run", "cut", "batch", "join"} and not DRY_RUN:
+            ensure_ffmpeg_present()
         return args.func(args) or 0
     except (ValueError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)

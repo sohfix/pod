@@ -6,13 +6,12 @@ import re
 import sys
 import textwrap
 from pathlib import Path
-from typing import List, Optional, Dict, Set, Tuple
-
-from tqdm import tqdm
+from typing import Dict, List, Optional, Set, Tuple
 
 # Use faster-whisper for accurate word timestamps
 #   pip install faster-whisper
 from faster_whisper import WhisperModel
+from tqdm import tqdm
 
 APP_NAME = "transcript"
 CONFIG_DIR = Path(os.getenv("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_NAME
