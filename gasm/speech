@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import re
+import json
+import asyncio
+from io import BytesIO
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+import click
+import yaml
+
+# Async TTS
+import edge_tts
+
+# Language detect + translation backends
+from langdetect import detect, DetectorFactory
+DetectorFactory.seed = 42
+
+# deep_translator (online)
+try:
+    from deep_translator import GoogleTranslator as _GT
+    HAVE_DEEP = True
+except Exception:
+    HAVE_DEEP = False
+
+# Argos Translate (offline, optional)
+try:
+    import argostranslate.package as argos_pkg
+    import argostranslate.translate as argos_translate
+    HAVE_ARGOS = True
+except Exception:
+    HAVE_ARGOS = False
+
+
+# ---------------------------------------------------------------------
+# Globals / paths
+# ---------------------------------------------------------------------
+APP_DIR = Path.home() / "apps/.app-data/speech/data"
+SPACES_FILE = APP_DIR / "spaces" / "spaces.json"
+DEFAULT_SPACE_NAME = "home"
+
+
+def _sanitize_hyphens(s: str) -> str:
+    return re.sub(r"[\u2010-\u2015]", "-", s)
+
+
+# ---------------------------------------------------------------------
+# Space manager
+# ---------------------------------------------------------------------
+class SpaceManager:
+    def __init__(self, file_path: Path):
+        self.file_path = file_path
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self.data = {"current": DEFAULT_SPACE_NAME, "spaces": {}}
+        if self.file_path.exists():
+            try:
+                self.data = json.loads(self.file_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        if DEFAULT_SPACE_NAME not in self.data["spaces"]:
+            root = APP_DIR / "spaces" / DEFAULT_SPACE_NAME
+            self.data["spaces"][DEFAULT_SPACE_NAME] = {
+                "in_dir": str(root / "in"),
+                "out_dir": str(root / "out"),
+                "active": True,
+            }
+            self._ensure_dirs(self.data["spaces"][DEFAULT_SPACE_NAME])
+            self._save()
+
+    def _save(self):
+        self.file_path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+
+    def _ensure_dirs(self, space: Dict[str, Any]):
+        Path(space["in_dir"]).mkdir(parents=True, exist_ok=True)
+        Path(space["out_dir"]).mkdir(parents=True, exist_ok=True)
+
+    def create(self, name: str, in_dir: Optional[str] = None, out_dir: Optional[str] = None):
+        if name in self.data["spaces"]:
+            raise click.ClickException(f"Space '{name}' already exists.")
+        root = APP_DIR / "spaces" / name
+        space = {
+            "in_dir": str(Path(in_dir) if in_dir else (root / "in")),
+            "out_dir": str(Path(out_dir) if out_dir else (root / "out")),
+            "active": False,
+        }
+        self._ensure_dirs(space)
+        self.data["spaces"][name] = space
+        self._save()
+        return space
+
+    def set_paths(self, in_dir: Optional[str], out_dir: Optional[str]):
+        cur = self.current_name()
+        s = self.data["spaces"][cur]
+        if in_dir:
+            s["in_dir"] = str(Path(in_dir))
+        if out_dir:
+            s["out_dir"] = str(Path(out_dir))
+        self._ensure_dirs(s)
+        self._save()
+
+    def change(self, name: str):
+        if name not in self.data["spaces"]:
+            raise click.ClickException(f"No such space '{name}'.")
+        self.data["current"] = name
+        self._save()
+
+    def start(self, name: Optional[str] = None):
+        nm = name or self.current_name()
+        self._space(nm)["active"] = True
+        self._save()
+
+    def stop(self, name: Optional[str] = None):
+        nm = name or self.current_name()
+        self._space(nm)["active"] = False
+        self._save()
+
+    def status(self) -> Dict[str, Any]:
+        return {"current": self.current_name(), "spaces": self.data["spaces"]}
+
+    def list(self) -> List[str]:
+        return list(self.data["spaces"].keys())
+
+    def current(self) -> Dict[str, Any]:
+        return self._space(self.current_name())
+
+    def current_name(self) -> str:
+        return self.data.get("current", DEFAULT_SPACE_NAME)
+
+    def _space(self, name: str) -> Dict[str, Any]:
+        if name not in self.data["spaces"]:
+            raise click.ClickException(f"No such space '{name}'.")
+        return self.data["spaces"][name]
+
+
+SP = SpaceManager(SPACES_FILE)
+
+
+# ---------------------------------------------------------------------
+# Parser / translation
+# ---------------------------------------------------------------------
+HEADER_RE = re.compile(r"^---\s*$")
+INLINE_TAG_RE = re.compile(r"\[(pause|speed|pitch|voice|lang|volume)=(.+?)\]", re.IGNORECASE)
+
+
+def parse_sections(text: str) -> List[Dict[str, Any]]:
+    lines, i, sections = text.splitlines(), 0, []
+
+    def read_yaml(start_idx):
+        buf, idx = [], start_idx
+        while idx < len(lines) and not HEADER_RE.match(lines[idx]):
+            buf.append(lines[idx])
+            idx += 1
+        return (yaml.safe_load("\n".join(buf)) or {}, idx)
+
+    if i < len(lines) and HEADER_RE.match(lines[i]):
+        i += 1
+        meta, i = read_yaml(i)
+        if i < len(lines) and HEADER_RE.match(lines[i]):
+            i += 1
+        text_buf = []
+        while i < len(lines):
+            if HEADER_RE.match(lines[i]):
+                sections.append({"meta": meta, "text": "\n".join(text_buf).strip()})
+                i += 1
+                meta, i = read_yaml(i)
+                if i < len(lines) and HEADER_RE.match(lines[i]):
+                    i += 1
+                text_buf = []
+            else:
+                text_buf.append(lines[i])
+                i += 1
+        sections.append({"meta": meta, "text": "\n".join(text_buf).strip()})
+    else:
+        sections.append({"meta": {}, "text": text.strip()})
+
+    for sec in sections:
+        m = sec["meta"]
+        m.setdefault("voice", "en-US-AriaNeural")
+        m.setdefault("lang", "en-US")
+        m.setdefault("speed", "+0%")
+        m.setdefault("pitch", "+0Hz")
+        m.setdefault("volume", "+0%")
+        m.setdefault("translate", "auto")
+        m["voice"] = _sanitize_hyphens(str(m["voice"]))
+    return [s for s in sections if s["text"]]
+
+
+LANG_MAP = {
+    "en": "en",
+    "en-US": "en",
+    "en-GB": "en",
+    "en-AU": "en",
+    "en-IE": "en",
+    "en-ZA": "en",
+    "es": "es",
+    "es-ES": "es",
+    "es-MX": "es",
+    "de": "de",
+    "de-DE": "de",
+    "it": "it",
+    "it-IT": "it",
+}
+
+
+def bcp47_to_iso2(lang): return LANG_MAP.get(lang, lang.split("-")[0].lower() if lang else "en")
+def detect_lang_iso2(text): 
+    try: return detect(text)
+    except: return "en"
+
+
+def _deep_translate(text, tgt):
+    if not HAVE_DEEP:
+        return None
+    try:
+        src = detect_lang_iso2(text)
+    except Exception:
+        return None
+    if src == tgt:
+        return text
+    return _GT(source=src, target=tgt).translate(text)
+
+
+def translate_text(text, target_bcp47, backend="auto"):
+    if backend == "off":
+        return text
+    tgt = bcp47_to_iso2(target_bcp47)
+    src = detect_lang_iso2(text)
+    if src == tgt and backend != "force":
+        return text
+    if backend in ("deep", "auto"):
+        t = _deep_translate(text, tgt)
+        if t:
+            return t
+    return text
+
+
+def maybe_translate_section(sec, mode, backend):
+    txt, header_lang = sec["text"].strip(), sec["meta"].get("lang", "en-US")
+    tgt = bcp47_to_iso2(header_lang)
+    if mode == "off":
+        return sec
+    if mode == "force":
+        sec["text"] = translate_text(txt, header_lang, backend)
+        return sec
+    if detect_lang_iso2(txt) != tgt:
+        sec["text"] = translate_text(txt, header_lang, backend)
+    return sec
+
+
+# ---------------------------------------------------------------------
+# Audio generation
+# ---------------------------------------------------------------------
+async def _edge_tts_bytes(text, voice, rate, pitch, volume):
+    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch, volume=volume)
+    out = BytesIO()
+    async for c in communicate.stream():
+        if c["type"] == "audio":
+            out.write(c["data"])
+    return out.getvalue()
+
+
+def _parse_actions(body):
+    acts, idx = [], 0
+    for m in INLINE_TAG_RE.finditer(body):
+        pre = body[idx:m.start()]
+        if pre.strip():
+            acts.append({"type": "say", "text": pre})
+        k, v = m.group(1).lower(), m.group(2).strip()
+        if k == "pause":
+            acts.append({"type": "pause", "ms": 500})
+        else:
+            acts.append({"type": "set", "key": k, "value": v})
+        idx = m.end()
+    tail = body[idx:]
+    if tail.strip():
+        acts.append({"type": "say", "text": tail})
+    return acts
+
+
+async def render_sections_to_audio(sections):
+    from pydub import AudioSegment
+    final = AudioSegment.silent(0)
+    for sec in sections:
+        meta = dict(sec["meta"])
+        actions = _parse_actions(sec["text"])
+        buf = AudioSegment.silent(0)
+        for a in actions:
+            if a["type"] == "say":
+                b = await _edge_tts_bytes(a["text"], meta["voice"], meta["speed"], meta["pitch"], meta["volume"])
+                buf += AudioSegment.from_file(BytesIO(b), format="mp3")
+            elif a["type"] == "pause":
+                buf += AudioSegment.silent(a["ms"])
+            elif a["type"] == "set":
+                meta[a["key"]] = a["value"]
+        final += buf + AudioSegment.silent(350)
+    return final
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+@click.group()
+def ttsx(): pass
+
+
+# ---------- SPEAK ----------
+@ttsx.command("speak")
+@click.argument("script_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("-o", "--output", default=None)
+@click.option("--preview", is_flag=True)
+@click.option("--translate", type=click.Choice(["auto", "off", "force"]), default="auto")
+@click.option("--translate-backend", type=click.Choice(["auto", "deep", "off"]), default="auto")
+def speak(script_path, output, preview, translate, translate_backend):
+    text = Path(script_path).read_text(encoding="utf-8")
+    secs = parse_sections(text)
+    secs = [maybe_translate_section(s, translate, translate_backend) for s in secs]
+    if preview:
+        for i, s in enumerate(secs, 1):
+            click.echo(f"Sec{i}: {s['meta']} text={s['text'][:30]}...")
+        return
+    if not output:
+        output = Path(SP.current()["out_dir"]) / (Path(script_path).stem + ".mp3")
+    else:
+        output = Path(output)
+    audio = asyncio.run(render_sections_to_audio(secs))
+    audio.export(str(output), format="mp3")
+    click.echo(f"✓ Wrote {output}")
+
+
+# ---------- LIST VOICES ----------
+@ttsx.command("list-voices")
+def list_voices():
+    async def run():
+        vs = await edge_tts.list_voices()
+        for v in vs:
+            click.echo(f"{v['Name']} {v['Locale']} {v.get('Gender','')}")
+    asyncio.run(run())
+
+
+# ---------- SPACES ----------
+@ttsx.group("space")
+def space():
+    """Manage workspaces (spaces)."""
+    pass
+
+
+@space.command("create")
+@click.argument("name")
+def space_create(name):
+    SP.create(name)
+    click.echo(f"✓ Created space {name}")
+
+
+@space.command("set")
+@click.option("--in", "in_dir")
+@click.option("--out", "out_dir")
+def space_set(in_dir, out_dir):
+    SP.set_paths(in_dir, out_dir)
+    click.echo(f"✓ Paths updated for {SP.current_name()}")
+
+
+@space.command("change")
+@click.argument("name")
+def space_change(name):
+    SP.change(name)
+    click.echo(f"✓ Current space {name}")
+
+
+@space.command("start")
+@click.argument("name", required=False)
+def space_start(name):
+    SP.start(name)
+    click.echo(f"✓ Started {name or SP.current_name()}")
+
+
+@space.command("stop")
+@click.argument("name", required=False)
+def space_stop(name):
+    SP.stop(name)
+    click.echo(f"✓ Stopped {name or SP.current_name()}")
+
+
+@space.command("status")
+def space_status():
+    st = SP.status()
+    for nm, sp in st["spaces"].items():
+        marker = "*" if nm == st["current"] else " "
+        click.echo(f"{marker} {nm} in={sp['in_dir']} out={sp['out_dir']} active={sp['active']}")
+
+
+@space.command("list")
+def space_list():
+    for nm in SP.list():
+        mark = " (current)" if nm == SP.current_name() else ""
+        click.echo(f"- {nm}{mark}")
+
+
+# ---------- MAIN ----------
+if __name__ == "__main__":
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    ttsx()
+

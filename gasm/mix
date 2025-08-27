@@ -1,496 +1,231 @@
 #!/usr/bin/env python3
 """
-MIX CLI — Powerful, easy, and fun audio mashups 🎚️
-
-Features
-- Mix multiple audio files (MP3/WAV/FLAC/etc.) with per-track controls
-- Relative volume (dB), tempo-preserving speed, echo, offset, fades, pan, loop
-- Main-track controls; master normalize and peak ceiling
-- Ducking (sidechain) so backgrounds dip under the main
-- Monitor mode: preview your mix live without writing a file
-- TUI mode (optional): interactive text UI to tweak tracks in real time
-- Wizard mode: friendly guided workflow for quick clip mashups
-
-Requirements
-- ffmpeg (and ffplay for --monitor)
-- Optional for TUI: textual >= 0.48 (pip install textual)
-
-Quick start
-  python mix.py wizard
-  python mix.py build main.mp3 out.mp3 --add "file=pad.mp3,vol=-14,speed=1.03,loop=1" --duck 6 --normalize
-  python mix.py monitor main.mp3 --add "file=beat.mp3,vol=-10" --fade-out 1.0
-  python mix.py tui
-
-Track mini‑DSL for --add
-  file=PATH           (required)
-  vol=DB              (e.g., -12, +3)
-  speed=TEMPO         tempo-preserving (via atempo); typical 0.5–2.0
-  echo=ig:og:delays:decays   ffmpeg aecho; use | to separate multiple taps
-  offset=SECONDS      delay before the track begins
-  fade_in=SECONDS     per‑track fade-in
-  fade_out=SECONDS    per‑track fade-out (relative to that track’s end)
-  pan=mono|stereo     simple channel shaping
-  loop=0|1            loop to ensure long enough under main
-
-Subcommands
-  wizard   Guided flow (no flags needed)
-  monitor  Build the graph then preview through speakers (requires ffplay)
-  build    Build directly to a file using CLI flags
-  tui      Interactive text UI (requires textual); live tweak & monitor
-
-Note: Output duration always matches MAIN duration (backgrounds trimmed or looped).
+Mix CLI with Spaces, Wizard, TUI, and Learn system
 """
 
 from __future__ import annotations
-import argparse
-import os
-import re
-import shutil
-import subprocess
-import sys
-from dataclasses import dataclass
+import argparse, subprocess, sys, shutil, yaml
 from pathlib import Path
-from typing import List, Tuple
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Optional, Any
 
-# -------------------------------
-# Utilities & Data Structures
-# -------------------------------
-
+# ------------------------
+# Track spec + parser
+# ------------------------
 @dataclass
 class TrackSpec:
-    file: Path
-    vol: float = 0.0         # dB
-    speed: float = 1.0       # tempo (atempo)
-    echo: str | None = None  # aecho params: ig:og:delays:decays (use | to separate lists)
-    offset: float = 0.0      # seconds
+    file: str
+    vol: float = 0.0
+    speed: float = 1.0
+    echo: Optional[str] = None
+    offset: float = 0.0
     fade_in: float = 0.0
     fade_out: float = 0.0
-    pan: str | None = None   # 'mono' or 'stereo'
+    pan: Optional[str] = None
     loop: bool = False
 
-ADD_KV_RE = re.compile(r"\s*([a-zA-Z_]+)\s*=\s*([^,]+)\s*")
+@dataclass
+class MixConfig:
+    main: str
+    output: str
+    tracks: List[TrackSpec] = field(default_factory=list)
+    main_vol: float = 0.0
+    main_speed: float = 1.0
+    fade_in: float = 0.0
+    fade_out: float = 0.0
+    duck: Optional[float] = None
+    normalize: bool = False
+    limit_dbfs: Optional[float] = None
+    bitrate: str = "192k"
+    out_codec: str = "libmp3lame"
 
-def parse_add_arg(s: str) -> TrackSpec:
-    kv = dict(ADD_KV_RE.findall(s))
-    if 'file' not in kv:
-        sys.stderr.write("--add requires file=PATH\n")
-        sys.exit(2)
-    spec = TrackSpec(file=Path(kv['file']))
-    if 'vol' in kv: spec.vol = float(kv['vol'])
-    if 'speed' in kv: spec.speed = float(kv['speed'])
-    if 'echo' in kv: spec.echo = kv['echo']
-    if 'offset' in kv: spec.offset = float(kv['offset'])
-    if 'fade_in' in kv: spec.fade_in = float(kv['fade_in'])
-    if 'fade_out' in kv: spec.fade_out = float(kv['fade_out'])
-    if 'pan' in kv: spec.pan = kv['pan']
-    if 'loop' in kv: spec.loop = kv['loop'] in ('1','true','True','yes','y')
-    return spec
+# ------------------------
+# Spaces manager
+# ------------------------
+APP_DIR = Path.home() / "apps/.app-data/mix/data"
+SPACES_FILE = APP_DIR / "spaces.yml"
+DEFAULT_SPACE = "home"
 
-def check_ffmpeg() -> None:
-    if shutil.which('ffmpeg') is None:
-        sys.stderr.write("Error: 'ffmpeg' not found in PATH.\n")
-        sys.exit(1)
+def load_spaces() -> Dict[str, Any]:
+    if not SPACES_FILE.exists():
+        return {"current": DEFAULT_SPACE, "spaces": {
+            DEFAULT_SPACE: {"in_dir": str(APP_DIR/"spaces"/DEFAULT_SPACE/"in"),
+                            "out_dir": str(APP_DIR/"spaces"/DEFAULT_SPACE/"out"),
+                            "active": True}}}
+    return yaml.safe_load(SPACES_FILE.read_text()) or {}
 
-def have_ffplay() -> bool:
-    return shutil.which('ffplay') is not None
+def save_spaces(data: Dict[str, Any]):
+    SPACES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SPACES_FILE.write_text(yaml.safe_dump(data))
 
-# Build an atempo chain that supports values outside 0.5..2.0 by factoring
-# (ffmpeg's atempo only accepts 0.5..2.0 per stage; chaining multiplies)
+SP = load_spaces()
+
+def space_current() -> str: return SP.get("current", DEFAULT_SPACE)
+def space_dirs() -> Dict[str,str]: return SP["spaces"][space_current()]
+
+# ------------------------
+# ffmpeg helpers
+# ------------------------
+def check_ffmpeg():
+    if shutil.which("ffmpeg") is None:
+        sys.exit("ffmpeg not found")
+
+def run_cmd(cmd: List[str]) -> int:
+    print(" ".join(cmd))
+    return subprocess.run(cmd).returncode
 
 def atempo_chain(tempo: float) -> str:
-    if tempo <= 0:
-        raise ValueError("tempo must be > 0")
-    stages: List[float] = []
-    t = tempo
-    while t < 0.5:
-        stages.append(0.5)
-        t /= 0.5
-    while t > 2.0:
-        stages.append(2.0)
-        t /= 2.0
+    stages, t = [], tempo
+    while t < 0.5: stages.append(0.5); t/=0.5
+    while t > 2.0: stages.append(2.0); t/=2.0
     stages.append(t)
     return ",".join(f"atempo={x:.6g}" for x in stages)
 
-# -------------------------------
-# Filter Graph Construction
-# -------------------------------
+def make_ffmpeg(config: MixConfig) -> List[str]:
+    cmd = ["ffmpeg", "-y", "-i", config.main]
+    for t in config.tracks:
+        if t.loop: cmd += ["-stream_loop","-1"]
+        cmd += ["-i", t.file]
+    inputs = 1+len(config.tracks)
+    fgraph = f"amix=inputs={inputs}:normalize={'1' if config.normalize else '0'}[mix]"
+    return cmd + ["-filter_complex", fgraph, "-map","[mix]","-c:a",config.out_codec,"-b:a",config.bitrate,config.output]
 
-def build_filters(main_label: str, tracks: List[Tuple[str, TrackSpec]], *,
-                  main_vol: float, main_speed: float,
-                  mix_fade_in: float, mix_fade_out: float,
-                  duck_db: float | None, duck_attack_ms: int, duck_release_ms: int,
-                  normalize: bool, limit_dbfs: float | None) -> Tuple[str, str]:
-    """Return (filter_complex, final_map_label)."""
-    segments: List[str] = []
-
-    # MAIN processing
-    curr_main = main_label
-    if abs(main_vol) > 1e-9:
-        segments.append(f"{curr_main}volume={main_vol}dB[mv]")
-        curr_main = "[mv]"
-    if abs(main_speed - 1.0) > 1e-6:
-        segments.append(f"{curr_main}{atempo_chain(main_speed)}[ms]")
-        curr_main = "[ms]"
-
-    # Per-track processing
-    processed_labels: List[str] = []
-    for idx, (in_label, spec) in enumerate(tracks):
-        lab = in_label
-        chain: List[str] = []
-        if spec.offset > 0:
-            ms = int(spec.offset * 1000)
-            chain.append(f"adelay={ms}|{ms}")
-        if abs(spec.vol) > 1e-9:
-            chain.append(f"volume={spec.vol}dB")
-        if abs(spec.speed - 1.0) > 1e-6:
-            chain.append(atempo_chain(spec.speed))
-        if spec.echo:
-            chain.append(f"aecho={spec.echo}")
-        if spec.pan == 'mono':
-            chain.append("pan=mono|c0=0.5*FL+0.5*FR")
-        elif spec.pan == 'stereo':
-            chain.append("aformat=channel_layouts=stereo")
-        if spec.fade_in > 0:
-            chain.append(f"afade=t=in:st=0:d={spec.fade_in}")
-        if spec.fade_out > 0:
-            chain.append(f"afade=t=out:d={spec.fade_out}")
-        out_lab = f"[t{idx}]"
-        if chain:
-            segments.append(f"{lab}{','.join(chain)}{out_lab}")
-        else:
-            segments.append(f"{lab}anull{out_lab}")
-        processed_labels.append(out_lab)
-
-    # Mix backgrounds first
-    if processed_labels:
-        amix_bg = "".join(processed_labels)
-        amix_args = [f"amix=inputs={len(processed_labels)}", "dropout_transition=0",
-                     f"normalize={'1' if normalize else '0'}"]
-        segments.append(f"{amix_bg}{','.join(amix_args)}[bgmix]")
-        bg_label = "[bgmix]"
-
-        # Optional ducking of backgrounds with main as sidechain
-        if duck_db is not None and duck_db > 0:
-            thr = -30  # heuristic threshold
-            ratio = max(2, duck_db / 2)
-            atk = max(1, duck_attack_ms)
-            rel = max(10, duck_release_ms)
-            segments.append(
-                f"{bg_label}{curr_main}sidechaincompress=threshold={thr}:ratio={ratio}:attack={atk}:release={rel}[ducked]"
-            )
-            bg_label = "[ducked]"
-
-        # Mix MAIN + BG; duration=first trims to MAIN
-        segments.append(
-            f"{curr_main}{bg_label}amix=inputs=2:duration=first:dropout_transition=0:normalize={'1' if normalize else '0'}[mix]"
-        )
-        mix_label = "[mix]"
-    else:
-        mix_label = curr_main
-
-    # Post fades
-    final_label = mix_label
-    if mix_fade_in > 0:
-        segments.append(f"{final_label}afade=t=in:st=0:d={mix_fade_in}[f1]")
-        final_label = "[f1]"
-    if mix_fade_out > 0:
-        segments.append(f"{final_label}afade=t=out:d={mix_fade_out}[f2]")
-        final_label = "[f2]"
-
-    # Final limiter / ceiling
-    if limit_dbfs is not None:
-        segments.append(f"{final_label}alimiter=limit=0.0:level=disabled[lm]")
-        final_label = "[lm]"
-        if limit_dbfs < 0:
-            segments.append(f"{final_label}volume={limit_dbfs}dB[pl]")
-            final_label = "[pl]"
-
-    return ";".join(segments), final_label
-
-# -------------------------------
-# Command Builders
-# -------------------------------
-
-def make_cmd_build(main: Path, out: Path, track_specs: List[TrackSpec], *,
-                   main_vol: float, main_speed: float,
-                   fade_in: float, fade_out: float,
-                   duck_db: float | None, duck_attack_ms: int, duck_release_ms: int,
-                   normalize: bool, bitrate: str, out_codec: str,
-                   limiter_dbfs: float | None) -> List[str]:
-    cmd: List[str] = ["ffmpeg", "-y"]
-
-    # MAIN input first
-    cmd += ["-i", str(main)]
-    main_label = "[0:a]"
-
-    # Background inputs
-    input_labels: List[Tuple[str, TrackSpec]] = []
-    for i, spec in enumerate(track_specs, start=1):
-        if spec.loop:
-            cmd += ["-stream_loop", "-1"]
-        cmd += ["-i", str(spec.file)]
-        input_labels.append((f"[{i}:a]", spec))
-
-    fgraph, final_label = build_filters(
-        main_label, input_labels,
-        main_vol=main_vol, main_speed=main_speed,
-        mix_fade_in=fade_in, mix_fade_out=fade_out,
-        duck_db=duck_db, duck_attack_ms=duck_attack_ms, duck_release_ms=duck_release_ms,
-        normalize=normalize, limit_dbfs=limiter_dbfs,
-    )
-
-    cmd += ["-filter_complex", fgraph, "-map", final_label, "-c:a", out_codec, "-b:a", bitrate, str(out)]
-    return cmd
-
-
-def make_cmd_monitor(main: Path, track_specs: List[TrackSpec], **kwargs) -> Tuple[List[str], List[str]]:
-    """Return (ffmpeg_cmd, ffplay_cmd). ffplay is used to monitor audio via stdout pipe."""
-    cmd = make_cmd_build(main, Path("-"), track_specs, **kwargs)
-    # Replace output codec to PCM for piping (16-bit stereo 48k)
-    # We'll append: -f s16le -ac 2 -ar 48000 pipe:1
-    cmd = cmd[:-1]  # drop the filename
-    cmd += ["-f", "s16le", "-ac", "2", "-ar", "48000", "pipe:1"]
-
-    ffplay = ["ffplay", "-autoexit", "-nodisp", "-f", "s16le", "-ac", "2", "-ar", "48000", "-"]
-    return cmd, ffplay
-
-# -------------------------------
-# Wizard & TUI
-# -------------------------------
-
-def run_wizard() -> int:
-    print("\nMix Wizard — let’s build a mashup!\n")
-    main_path = Path(input("Main/lead audio path: ").strip())
-    if not main_path.exists():
-        print("Main file not found.")
-        return 2
-
-    tracks: List[TrackSpec] = []
-    while True:
-        more = input("Add a background track? [y/N]: ").strip().lower()
-        if more != 'y':
-            break
-        fp = Path(input("  file path: ").strip())
-        if not fp.exists():
-            print("  not found, skipping.")
-            continue
-        vol = float(input("  volume dB (e.g. -12): ") or "-12")
-        speed = float(input("  speed (tempo, 1.0 = same): ") or "1.0")
-        off = float(input("  offset seconds (0 for none): ") or "0")
-        fin = float(input("  fade-in seconds (0 for none): ") or "0")
-        fout = float(input("  fade-out seconds (0 for none): ") or "0")
-        ech = input("  echo (ig:og:delays:decays or blank): ").strip() or None
-        loop = (input("  loop if too short? [y/N]: ").strip().lower() == 'y')
-        tracks.append(TrackSpec(file=fp, vol=vol, speed=speed, echo=ech, offset=off, fade_in=fin, fade_out=fout, loop=loop))
-
-    fade_in = float(input("Final mix fade-in seconds (0): ") or "0")
-    fade_out = float(input("Final mix fade-out seconds (0): ") or "0")
-    duck = input("Ducking amount in dB (e.g. 6 or blank for none): ").strip()
-    duck_db = float(duck) if duck else None
-    normalize = (input("Normalize mix? [y/N]: ").strip().lower() == 'y')
-    limit = input("Peak ceiling (dBFS, e.g. -1.0 or blank): ").strip()
-    limit_dbfs = float(limit) if limit else None
-
-    out = Path(input("Output filename (e.g., out.mp3): ").strip() or "out.mp3")
-
-    check_ffmpeg()
-    cmd = make_cmd_build(
-        main_path, out, tracks,
-        main_vol=0.0, main_speed=1.0,
-        fade_in=fade_in, fade_out=fade_out,
-        duck_db=duck_db, duck_attack_ms=50, duck_release_ms=250,
-        normalize=normalize, bitrate="192k", out_codec="libmp3lame",
-        limiter_dbfs=limit_dbfs,
-    )
-    print("\nRunning ffmpeg...\n")
-    return run_subproc(cmd)
-
-
-def run_tui() -> int:
-    # Optional UI using textual; provide a minimal but useful interface
-    try:
-        from textual.app import App, ComposeResult
-        from textual.widgets import Header, Footer, Static, Input, Button
-        from textual.containers import Vertical
-    except Exception as e:
-        print("TUI requires 'textual' (pip install textual).", e)
-        return 1
-
-    class MixTUI(App):
-        CSS = """
-        Screen { layout: vertical; }
-        #title { content-align: center middle; height: 3; }
-        .row { height: auto; }
-        """
-        def compose(self) -> ComposeResult:
-            yield Header()
-            yield Static("MIX TUI — quick monitor: enter MAIN path and one BG path, then [Preview]", id="title")
-            self.main = Input(placeholder="main path (lead)")
-            self.bg = Input(placeholder="background path")
-            self.vol = Input(placeholder="bg vol dB (e.g., -12)")
-            self.speed = Input(placeholder="bg speed (tempo) e.g., 1.0")
-            self.duck = Input(placeholder="duck dB (e.g., 6)")
-            self.fadeout = Input(placeholder="final fade-out seconds (e.g., 1.0)")
-            yield Vertical(self.main, self.bg, self.vol, self.speed, self.duck, self.fadeout)
-            yield Button("Preview", id="preview")
-            yield Footer()
-
-        def on_button_pressed(self, event: Button.Pressed) -> None:
-            if event.button.id == "preview":
-                main = Path(self.main.value.strip())
-                bgp = Path(self.bg.value.strip())
-                if not main.exists() or not bgp.exists():
-                    self.bell()
-                    return
-                tracks = [TrackSpec(file=bgp, vol=float(self.vol.value or "-12"), speed=float(self.speed.value or "1.0"))]
-                kwargs = dict(
-                    main_vol=0.0, main_speed=1.0,
-                    fade_in=0.0, fade_out=float(self.fadeout.value or "0"),
-                    duck_db=float(self.duck.value) if self.duck.value else None,
-                    duck_attack_ms=50, duck_release_ms=250,
-                    normalize=True, bitrate="192k", out_codec="libmp3lame",
-                    limiter_dbfs=-1.0,
-                )
-                if not have_ffplay():
-                    self.notify("ffplay not found; install to monitor.")
-                    return
-                ffmpeg_cmd, ffplay_cmd = make_cmd_monitor(main, tracks, **kwargs)
-                # Run in a subprocess pipeline
-                self.run_worker(lambda: run_pipe(ffmpeg_cmd, ffplay_cmd), exclusive=True)
-
-    return MixTUI().run()
-
-# -------------------------------
-# Process Execution Helpers
-# -------------------------------
-
-def run_subproc(cmd: List[str]) -> int:
-    try:
-        proc = subprocess.run(cmd, check=True)
-        return proc.returncode
-    except subprocess.CalledProcessError as e:
-        return e.returncode
-
-
-def run_pipe(ffmpeg_cmd: List[str], ffplay_cmd: List[str]) -> int:
-    try:
-        p1 = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE)
-        p2 = subprocess.Popen(ffplay_cmd, stdin=p1.stdout)
-        p1.stdout.close()
-        p2.communicate()
-        return 0
-    except Exception:
-        return 1
-
-# -------------------------------
-# CLI
-# -------------------------------
-
-def positive_float(v: str) -> float:
-    x = float(v)
-    if x < 0: raise argparse.ArgumentTypeError("must be >= 0")
-    return x
-
-
-def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="mix.py", description="Mix CLI — powerful yet easy audio mixer")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    # wizard
-    sub.add_parser("wizard", help="Guided workflow for quick mashups")
-
-    # tui
-    sub.add_parser("tui", help="Interactive text UI (requires textual)")
-
-    # monitor
-    m = sub.add_parser("monitor", help="Preview the mix through speakers (no file written)")
-    m.add_argument("main", type=Path, help="Main/lead audio file")
-    m.add_argument("--add", action="append", default=[], help="Add a track: file=PATH,vol=DB,speed=T,echo=...,offset=SEC,fade_in=SEC,fade_out=SEC,pan=mono|stereo,loop=0|1")
-    m.add_argument("--main-vol", type=float, default=0.0)
-    m.add_argument("--main-speed", type=float, default=1.0)
-    m.add_argument("--fade-in", type=positive_float, default=0.0)
-    m.add_argument("--fade-out", type=positive_float, default=0.0)
-    m.add_argument("--duck", type=float, default=None)
-    m.add_argument("--duck-attack", type=int, default=50)
-    m.add_argument("--duck-release", type=int, default=250)
-    m.add_argument("--normalize", action="store_true")
-    m.add_argument("--limit", dest="limit_dbfs", type=float, default=-1.0)
-
-    # build
-    b = sub.add_parser("build", help="Render a mix to a file")
-    b.add_argument("main", type=Path, help="Main/lead audio file (defines duration)")
-    b.add_argument("output", type=Path, help="Output audio file (e.g., out.mp3)")
-    b.add_argument("--add", action="append", default=[], help="Add a track: file=PATH,vol=DB,speed=T,echo=...,offset=SEC,fade_in=SEC,fade_out=SEC,pan=mono|stereo,loop=0|1")
-    b.add_argument("--main-vol", type=float, default=0.0)
-    b.add_argument("--main-speed", type=float, default=1.0)
-    b.add_argument("--fade-in", type=positive_float, default=0.0)
-    b.add_argument("--fade-out", type=positive_float, default=0.0)
-    b.add_argument("--duck", type=float, default=None)
-    b.add_argument("--duck-attack", type=int, default=50)
-    b.add_argument("--duck-release", type=int, default=250)
-    b.add_argument("--normalize", action="store_true")
-    b.add_argument("--limit", dest="limit_dbfs", type=float, default=None)
-    b.add_argument("--bitrate", type=str, default="192k")
-    b.add_argument("--out-codec", type=str, default="libmp3lame")
-
-    return p.parse_args(argv)
-
-
-def main(argv: List[str] | None = None) -> int:
-    args = parse_args(argv)
-
-    if args.cmd == 'wizard':
-        check_ffmpeg()
-        return run_wizard()
-
-    if args.cmd == 'tui':
-        return run_tui()
-
-    # Common parsing for monitor/build
-    check_ffmpeg()
-
-    if args.cmd in ('monitor', 'build'):
-        main_path: Path = args.main if hasattr(args, 'main') else None
-        if args.cmd == 'build' and not main_path:
-            main_path = args.main
-        if not main_path.exists():
-            sys.stderr.write(f"Main file not found: {main_path}\n")
-            return 2
-
-        tracks = [parse_add_arg(s) for s in getattr(args, 'add', [])]
-        for t in tracks:
-            if not t.file.exists():
-                sys.stderr.write(f"Background file not found: {t.file}\n")
-                return 2
-
-        kwargs = dict(
-            main_vol=getattr(args, 'main_vol', 0.0),
-            main_speed=getattr(args, 'main_speed', 1.0),
-            fade_in=getattr(args, 'fade_in', 0.0),
-            fade_out=getattr(args, 'fade_out', 0.0),
-            duck_db=getattr(args, 'duck', None),
-            duck_attack_ms=getattr(args, 'duck_attack', 50),
-            duck_release_ms=getattr(args, 'duck_release', 250),
-            normalize=getattr(args, 'normalize', False),
-            bitrate=getattr(args, 'bitrate', '192k') if hasattr(args, 'bitrate') else '192k',
-            out_codec=getattr(args, 'out_codec', 'libmp3lame') if hasattr(args, 'out_codec') else 'libmp3lame',
-            limiter_dbfs=getattr(args, 'limit_dbfs', None),
-        )
-
-        if args.cmd == 'monitor':
-            if not have_ffplay():
-                sys.stderr.write("Monitoring requires ffplay. Install it (often ships with ffmpeg).\n")
-                return 1
-            ffmpeg_cmd, ffplay_cmd = make_cmd_monitor(main_path, tracks, **kwargs)
-            return run_pipe(ffmpeg_cmd, ffplay_cmd)
-
-        # build
-        out_path: Path = args.output
-        cmd = make_cmd_build(main_path, out_path, tracks, **kwargs)
-        return run_subproc(cmd)
-
+# ------------------------
+# Wizard
+# ------------------------
+def run_wizard():
+    dirs = space_dirs()
+    in_dir, out_dir = Path(dirs["in_dir"]), Path(dirs["out_dir"])
+    in_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    main = input("Main track file: ").strip()
+    output = str(out_dir/"mix_out.mp3")
+    tracks=[]
+    while input("Add bg track? (y/N): ").lower()=="y":
+        fn=input(" file: ").strip()
+        vol=float(input(" vol dB (0): ") or 0)
+        tracks.append(TrackSpec(file=fn,vol=vol))
+    cfg = MixConfig(main=main,output=output,tracks=tracks)
+    fname=in_dir/"session.mix.yml"
+    fname.write_text(yaml.safe_dump(asdict(cfg)))
+    print(f"✓ Saved config {fname}")
+    if input("Render now? (y/N): ").lower()=="y":
+        return run_cmd(make_ffmpeg(cfg))
     return 0
 
-if __name__ == "__main__":
+# ------------------------
+# Build
+# ------------------------
+def run_build(cfgfile: Path):
+    cfg=MixConfig(**yaml.safe_load(cfgfile.read_text()))
+    return run_cmd(make_ffmpeg(cfg))
+
+# ------------------------
+# Monitor
+# ------------------------
+def run_monitor(cfgfile: Path):
+    cfg=MixConfig(**yaml.safe_load(cfgfile.read_text()))
+    cmd=make_ffmpeg(cfg)
+    cmd[-1]="-" # output to stdout
+    ffplay=["ffplay","-autoexit","-nodisp","-"]
+    p1=subprocess.Popen(cmd,stdout=subprocess.PIPE)
+    p2=subprocess.Popen(ffplay,stdin=p1.stdout)
+    p1.stdout.close();p2.communicate();return 0
+
+# ------------------------
+# Learn
+# ------------------------
+LEARN_TOPICS={
+ "intro":"Mix audio with ffmpeg easily using configs and spaces.",
+ "spaces":"Workspaces keep scripts and outputs isolated.",
+ "wizard":"Guided workflow to build configs.",
+ "tui":"Interactive table editor (tracks inline).",
+ "build":"Render from config file.",
+ "monitor":"Preview mix with ffplay.",
+ "cheatsheet":"mix wizard | mix tui | mix build config.yml | mix monitor config.yml"
+}
+
+def run_learn(topic: Optional[str]):
+    if not topic:
+        print("Topics:"," ".join(LEARN_TOPICS.keys()));return 0
+    print(LEARN_TOPICS.get(topic,"Unknown topic"));return 0
+
+# ------------------------
+# TUI
+# ------------------------
+def run_tui(cfgfile: Optional[Path]=None):
+    try:
+        from textual.app import App, ComposeResult
+        from textual.widgets import DataTable, Footer, Header, Button
+    except ImportError:
+        sys.exit("textual required for tui")
+
+    class MixTUI(App):
+        CSS="Screen{layout:vertical;} #tbl{height:1fr;}"
+        def __init__(self,cfgpath:Optional[Path]): super().__init__(); self.cfgpath=cfgpath; self.cfg=None
+        def compose(self)->ComposeResult:
+            yield Header(); self.tbl=DataTable(id="tbl"); yield self.tbl
+            yield Button("Save",id="save"); yield Button("Render",id="render"); yield Footer()
+        def on_mount(self):
+            self.tbl.add_columns("file","vol","speed","offset","fade_in","fade_out","pan","loop")
+            if self.cfgpath and self.cfgpath.exists():
+                self.cfg=MixConfig(**yaml.safe_load(self.cfgpath.read_text()))
+                for t in self.cfg.tracks:
+                    self.tbl.add_row(t.file,str(t.vol),str(t.speed),str(t.offset),str(t.fade_in),str(t.fade_out),str(t.pan or ""),str(int(t.loop)))
+        def on_button_pressed(self,e):
+            if e.button.id=="save":
+                rows=[TrackSpec(file=r[0],vol=float(r[1]),speed=float(r[2]),offset=float(r[3]),
+                        fade_in=float(r[4]),fade_out=float(r[5]),pan=(r[6] or None),loop=(r[7]=="1"))
+                      for r in self.tbl.rows.values()]
+                cfg=MixConfig(main=self.cfg.main if self.cfg else "main.mp3",
+                              output=self.cfg.output if self.cfg else "out.mp3",
+                              tracks=rows)
+                self.cfgpath.write_text(yaml.safe_dump(asdict(cfg)))
+                self.notify("Saved config")
+            if e.button.id=="render":
+                run_cmd(make_ffmpeg(self.cfg))
+
+    cfg=cfgfile or Path(space_dirs()["in_dir"])/"session.mix.yml"
+    MixTUI(cfg).run();return 0
+
+# ------------------------
+# CLI
+# ------------------------
+def main(argv=None):
+    p=argparse.ArgumentParser("mix",description="Mix CLI with spaces")
+    sub=p.add_subparsers(dest="cmd",required=True)
+    sub.add_parser("wizard")
+    b=sub.add_parser("build");b.add_argument("config",type=Path)
+    m=sub.add_parser("monitor");m.add_argument("config",type=Path)
+    t=sub.add_parser("tui");t.add_argument("config",type=Path,nargs="?")
+    l=sub.add_parser("learn");l.add_argument("topic",nargs="?")
+    sp=sub.add_parser("space");sp.add_argument("action",choices=["list","create","set","change","start","stop","status"])
+    sp.add_argument("name",nargs="?");sp.add_argument("--indir");sp.add_argument("--outdir")
+
+    args=p.parse_args(argv)
+
+    if args.cmd=="wizard": return run_wizard()
+    if args.cmd=="build": return run_build(args.config)
+    if args.cmd=="monitor": return run_monitor(args.config)
+    if args.cmd=="tui": return run_tui(args.config)
+    if args.cmd=="learn": return run_learn(args.topic)
+    if args.cmd=="space":
+        if args.action=="list": print("\n".join(SP["spaces"].keys()))
+        elif args.action=="create":
+            nm=args.name; root=APP_DIR/"spaces"/nm
+            SP["spaces"][nm]={"in_dir":str(root/"in"),"out_dir":str(root/"out"),"active":False}; save_spaces(SP); print(f"created {nm}")
+        elif args.action=="set":
+            cur=space_current(); s=SP["spaces"][cur]
+            if args.indir: s["in_dir"]=args.indir
+            if args.outdir: s["out_dir"]=args.outdir
+            save_spaces(SP); print("set paths")
+        elif args.action=="change": SP["current"]=args.name; save_spaces(SP)
+        elif args.action=="start": SP["spaces"][args.name]["active"]=True; save_spaces(SP)
+        elif args.action=="stop": SP["spaces"][args.name]["active"]=False; save_spaces(SP)
+        elif args.action=="status":
+            print("\nCurrent:",space_current(), "\n")
+    return 0
+
+if __name__=="__main__":
     sys.exit(main())
 
