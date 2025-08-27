@@ -259,7 +259,18 @@ TIME_PATTERNS = [
 ]
 
 def parse_time(ts: str) -> float:
-    s = ts.strip()
+    """
+    Parse time strings with optional milliseconds.
+    Accepts:
+      • M:SS(.ms)
+      • H:MM:SS(.ms)
+      • seconds(.ms)
+      • "end" → sentinel (-1.0)
+    """
+    s = ts.strip().lower()
+    if s in {"end", "0end"}:
+        return -1.0  # sentinel for EOF
+    
     for pat in TIME_PATTERNS:
         m = pat.match(s)
         if m:
@@ -267,9 +278,8 @@ def parse_time(ts: str) -> float:
             m_ = float(m.groupdict().get("m") or 0)
             s_ = float(m.groupdict().get("s") or 0)
             return h * 3600.0 + m_ * 60.0 + s_
-    raise ValueError(
-        f"Invalid time format: {ts!r}  (use M:SS(.ms), H:MM:SS(.ms), or seconds(.ms))"
-    )
+    raise ValueError(f"Invalid time format: {ts!r}  (use M:SS(.ms), H:MM:SS(.ms), seconds(.ms), or 'end')")
+
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
@@ -380,12 +390,16 @@ def run_ffmpeg_cut(
     Cut a segment from input. If edge_fade>0, apply tiny fades to prevent clicks (re-encode).
     If copy=True and any filter/mono/cbr enabled, we re-encode automatically.
     Uses .part temp file then atomic rename.
+
+    Special: pass end_s == -1.0 to mean "until EOF".
     """
     ensure_ffmpeg_present()
-    if end_s <= start_s:
-        raise ValueError("end must be greater than start")
 
-    duration = end_s - start_s
+    # validate range (allow -1.0 == EOF)
+    if end_s != -1.0 and end_s <= start_s:
+        raise ValueError("end must be greater than start (or -1.0/'end' for EOF)")
+
+    duration: Optional[float] = None if end_s == -1.0 else (end_s - start_s)
 
     # finalize out path with prefix/suffix
     final_out = out_path
@@ -399,30 +413,36 @@ def run_ffmpeg_cut(
     if comment:
         meta += ["-metadata", f"comment={comment}"]
 
-    cmd = [
-        "ffmpeg",
-        *ffmpeg_base_args(),
-        "-ss",
-        f"{start_s:.3f}",
-        "-t",
-        f"{duration:.3f}",
-        "-i",
-        str(input_mp3),
-    ]
+    # Build base ffmpeg command
+    # Note: we place -t BEFORE -i for accurate keyframe trimming when re-encoding,
+    # but only when duration is known. For EOF (-1.0) we omit -t entirely.
+    cmd = ["ffmpeg", *ffmpeg_base_args(), "-ss", f"{start_s:.3f}"]
+    if duration is not None:
+        cmd += ["-t", f"{duration:.3f}"]
+    cmd += ["-i", str(input_mp3)]
 
+    # -------- Filters --------
     filter_chain: List[str] = []
-    # optional trim-silence on the clipped segment (requires re-encode)
+
+    # Optional trim-silence on the clipped segment (requires re-encode)
     tsf = build_trim_silence_filter(trim_silence, silence_threshold_db, silence_min)
     if tsf:
         filter_chain.append(tsf)
 
-    # edge fades
+    # Edge fades: we can always do fade-in; fade-out needs a known duration.
     if edge_fade > 0:
-        st_out = max(0.0, duration - edge_fade)
+        # fade-in
         filter_chain.append(f"afade=t=in:st=0:d={edge_fade}")
-        filter_chain.append(f"afade=t=out:st={st_out:.3f}:d={edge_fade}")
+        # fade-out only if we know the trimmed duration
+        if duration is not None and duration > edge_fade:
+            st_out = max(0.0, duration - edge_fade)
+            filter_chain.append(f"afade=t=out:st={st_out:.3f}:d={edge_fade}")
+        elif duration is None and VERBOSE:
+            # We can't compute st for the out-fade without a known duration.
+            # (If you need a guaranteed out-fade at EOF, pre-trim with an explicit end time.)
+            print(f"note: end=EOF so only applying edge fade-in for {final_out.name}", file=sys.stderr)
 
-    # decide copy vs encode
+    # -------- Copy vs Re-encode --------
     reencode_needed = bool(filter_chain) or mono or bool(cbr)
     if copy and not reencode_needed:
         codec_args = ["-c", "copy"]
@@ -433,18 +453,21 @@ def run_ffmpeg_cut(
         if copy and reencode_needed:
             print(f"note: re-encoding {final_out.name} (copy disabled by filters/mono/CBR)")
 
-    # metadata copying
+    # Metadata copying
     meta_copy_args: List[str] = []
     if copy_meta:
         meta_copy_args = ["-map_metadata", "0"]
 
+    # Output
     cmd += filter_args + codec_args + meta_copy_args + meta + [str(tmp_out)]
+
     if run_subprocess(cmd) != 0:
         raise RuntimeError(f"ffmpeg failed for {final_out.name}")
 
     # atomic rename
     if not DRY_RUN:
         tmp_out.replace(final_out)
+
 
 def sniff_has_header(row: List[str]) -> bool:
     joined = ",".join(c.strip().lower() for c in row)
