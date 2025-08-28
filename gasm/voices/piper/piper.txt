@@ -1,0 +1,4 @@
+piper --model ~/.local/share/piper/voices/en_US-ryan-low.onnx \
+  --output_file wavfile.wav \
+  -- "TEXTHERE"
+
