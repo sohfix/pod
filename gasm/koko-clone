@@ -1,0 +1,14 @@
+from TTS.api import TTS
+
+# Load XTTS
+tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+tts.to("cuda")  # instead of gpu=True
+
+# Clone voice
+tts.tts_to_file(
+    text="This is my cloned voice running inside the clone environment.",
+    speaker_wav="/home/sohfix/Desktop/out_Jessica.wav",
+    language="en",
+    file_path="/home/sohfix/Desktop/cloned_test.wav"
+)
+

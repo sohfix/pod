@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""
+voi-kokoro — super-simple YAML-driven TTS CLI using Kokoro (offline, no API key)
+
+Features
+- Reads .voi YAML files (batch friendly)
+- Uses the external `kokoro-tts` CLI under the hood (keeps this tool tiny)
+- Lets you pick any installed Kokoro voice per item
+- Minimal options: voice, outfile, text/ssml
+
+Install prerequisites
+    pip install pyyaml click
+    # then install Kokoro per its README so `kokoro-tts` is in PATH and voices are installed
+
+YAML schema (.voi)
+    version: 1
+    default:
+      voice: af_bella         # pick any Kokoro voice you have
+      output_dir: out
+    items:
+      - id: hello
+        text: "Hello from Kokoro!"
+        outfile: hello.wav    # extension controls format (`kokoro-tts` writes based on -o path)
+      - id: alt
+        text: "Another line, different voice."
+        voice: af_sarah
+        outfile: alt.wav
+
+Usage
+    python voi-kokoro.py synth book.voi
+    python voi-kokoro.py voices         # lists voices via `kokoro-tts --list-voices`
+
+Notes
+- This wrapper calls `kokoro-tts` via subprocess. If you want a pure-Python integration later, we can add it.
+- Pitch/rate controls vary by Kokoro build; to keep things portable, this version focuses on voice selection + output.
+"""
+from __future__ import annotations
+
+import subprocess
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+import typing as T
+
+import click
+import yaml
+
+KOKORO_BIN = shutil.which("kokoro-tts")
+
+# -----------------
+# Data classes
+# -----------------
+@dataclass
+class Defaults:
+    voice: str | None = None
+    output_dir: str = "out"
+
+@dataclass
+class Item:
+    id: str
+    text: str | None = None
+    ssml: str | None = None
+    voice: str | None = None
+    outfile: str | None = None
+
+@dataclass
+class VoiDoc:
+    version: int
+    default: Defaults
+    items: list[Item]
+
+# -----------------
+# Helpers
+# -----------------
+
+def load_voi(path: Path) -> VoiDoc:
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise click.ClickException("YAML root must be a mapping")
+
+    version = int(data.get("version", 1))
+    d = data.get("default", {}) or {}
+    defaults = Defaults(
+        voice=d.get("voice"),
+        output_dir=d.get("output_dir", "out"),
+    )
+
+    items = []
+    for i, raw in enumerate(data.get("items") or []):
+        if not isinstance(raw, dict):
+            raise click.ClickException(f"items[{i}] must be a mapping")
+        item = Item(
+            id=str(raw.get("id") or f"item{i+1}"),
+            text=raw.get("text"),
+            ssml=raw.get("ssml"),
+            voice=raw.get("voice"),
+            outfile=raw.get("outfile"),
+        )
+        if not (item.text or item.ssml):
+            raise click.ClickException(f"items[{i}] needs 'text' or 'ssml'")
+        items.append(item)
+
+    return VoiDoc(version=version, default=defaults, items=items)
+
+
+def ensure_outdir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_outfile(default_dir: Path, item: Item) -> Path:
+    name = item.outfile or f"{item.id}.wav"
+    return (default_dir / name).resolve()
+
+
+def run_kokoro(text: str, voice: str, outpath: Path):
+    if not KOKORO_BIN:
+        raise click.ClickException(
+            "`kokoro-tts` not found in PATH. Install Kokoro and ensure the CLI is available.")
+
+    # Common kokoro-tts syntax (text, voice, output). Some builds accept --voice/-v and -o.
+    cmd: list[str] = [KOKORO_BIN, "-v", voice, text, "-o", str(outpath)]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise click.ClickException(f"kokoro-tts failed for voice '{voice}': {e}")
+
+# -----------------
+# CLI
+# -----------------
+@click.group()
+def cli():
+    """YAML-driven TTS wrapper for Kokoro."""
+
+
+@cli.command()
+@click.argument("voi_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def synth(voi_file: Path):
+    """Synthesize all items in the .voi YAML with Kokoro."""
+    doc = load_voi(voi_file)
+    outdir = Path(doc.default.output_dir)
+    ensure_outdir(outdir)
+
+    for item in doc.items:
+        voice = item.voice or (doc.default.voice or "af_bella")
+        outpath = resolve_outfile(outdir, item)
+        text = item.text or item.ssml or ""
+        click.echo(f"[kokoro] {item.id}: voice={voice} -> {outpath}")
+        run_kokoro(text=text, voice=voice, outpath=outpath)
+
+    click.secho("Done.", fg="green")
+
+
+@cli.command()
+@click.option("match", "--match", help="Filter voices by substring (case-insensitive)")
+def voices(match: str | None):
+    """List Kokoro voices via `kokoro-tts --list-voices`."""
+    if not KOKORO_BIN:
+        raise click.ClickException("`kokoro-tts` not found in PATH.")
+    # Try a conventional list flag set; fall back to help if needed.
+    tried = ["--list-voices", "--voices", "-L"]
+    output = None
+    for flag in tried:
+        try:
+            res = subprocess.run([KOKORO_BIN, flag], check=True, capture_output=True, text=True)
+            output = res.stdout.strip()
+            break
+        except Exception:
+            continue
+    if not output:
+        # Last resort: print help so users can see the correct flag on their build
+        res = subprocess.run([KOKORO_BIN, "--help"], capture_output=True, text=True)
+        click.echo(res.stdout)
+        click.echo("\n(Unable to auto-list voices; check the correct flag from help above.)")
+        return
+
+    lines = output.splitlines()
+    if match:
+        m = match.lower()
+        lines = [ln for ln in lines if m in ln.lower()]
+    for ln in lines:
+        click.echo(ln)
+
+
+if __name__ == "__main__":
+    cli()
+
